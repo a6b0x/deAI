@@ -1,0 +1,43 @@
+services:
+  # Gitea — 自托管 Git 服务，代码仓库
+  gitea:
+    image: gitea/gitea:1.23
+    container_name: infra-gitea
+    restart: unless-stopped
+    ports:
+      # Web 界面，避开 Grafana 的 3000
+      - "3100:3000"
+      # SSH 克隆（宿主机 :2222 → 容器 :22）
+      - "2222:22"
+    volumes:
+      - gitea_data:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+
+  # Registry — 私有 Docker 镜像仓库（API）
+  registry:
+    image: registry:2
+    container_name: infra-registry
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - registry_data:/var/lib/registry
+      - ./registry-config.yml:/etc/docker/registry/config.yml:ro
+
+  # Registry UI — 镜像仓库管理界面
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    container_name: infra-registry-ui
+    restart: unless-stopped
+    ports:
+      - "5100:80"
+    environment:
+      # 启用 nginx 反向代理模式，前端请求走同源 /v2，nginx 转发到 registry:5000
+      NGINX_PROXY_PASS_URL: "http://registry:5000"
+      REGISTRY_URL: ""
+      DELETE_IMAGES: "true"
+
+volumes:
+  gitea_data:
+  registry_data:

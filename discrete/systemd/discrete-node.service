@@ -1,0 +1,26 @@
+# Discrete Node-Only systemd service (no mining)
+# Use for public P2P seed nodes or chain synchronization before mining.
+
+[Unit]
+Description=Discrete Cash Daemon (Node Only, No Mining)
+Documentation=https://docs.discrete.cash/#/operators/node-operation
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/deAI/discrete
+
+ExecStart=/root/deAI/discrete/scripts/04-start-node.sh --foreground
+
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=120
+KillMode=mixed
+KillSignal=SIGTERM
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=discrete-node
+
+[Install]
+WantedBy=multi-user.target

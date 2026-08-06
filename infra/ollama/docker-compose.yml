@@ -1,0 +1,106 @@
+# =============================================================================
+# Ollama 服务 (双 RTX 4090)
+# =============================================================================
+#
+# 独立部署，已迁移原 coding-agent 全部数据。
+#
+# 优化变更:
+#
+#   新增 OLLAMA_FLASH_ATTENTION=1     → 推理速度提升 30-50%
+#   新增 OLLAMA_KV_CACHE_TYPE=q8_0    → 节省 2-3GB 显存, 支撑更长上下文
+#   新增 OLLAMA_SCHED_SPREAD=1        → 模型跨双卡分布, 利用第二张 4090
+#   新增 OLLAMA_NUM_PARALLEL=2        → 允许 2 个并行请求
+#   新增 OLLAMA_MAX_LOADED_MODELS=2   → 允许加载 2 个模型
+#   推荐使用 qwen3-coder-opt:30b      → Modelfile 固定 32K 上下文, 防止原生 256K 打爆显存
+#
+# 模型存储:
+#   模型权重文件: /root/deAI/infra/ollama/data/  (宿主机直接挂载,已从 /root/deAI/infra/models 迁移)
+#   查看已下载:   docker exec ollama ollama list
+#
+# 上下文设置:
+#   不需要为不同上下文创建多个模型名。
+#   API 调用时通过 options.num_ctx 动态指定即可:
+#     curl ... -d '{"model":"qwen3-coder:30b","options":{"num_ctx":32768}}'
+#   Open WebUI 中也可以在模型设置里调整 Context Length。
+#
+# 用法:
+#   cd /root/deAI/infra/ollama && docker compose up -d
+# =============================================================================
+
+services:
+  ollama:
+    image: ollama/ollama:0.32.4
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    environment:
+      # --- 原有配置 ---
+      OLLAMA_KEEP_ALIVE: "-1"           # 模型常驻显存, 避免冷启动
+      OLLAMA_HOST: "0.0.0.0:11434"      # 监听所有网卡
+      HTTPS_PROXY: ""
+      HTTP_PROXY: ""
+      NO_PROXY: "127.0.0.1,localhost,ollama,open-webui"
+      OLLAMA_TIMEOUT: "900"
+
+      # --- 性能优化 (新增) ---
+      # 启用 Flash Attention — 减少 30-50% attention 计算时间
+      OLLAMA_FLASH_ATTENTION: "1"
+
+      # KV Cache 量化 — f16 → q8_0, 显存节省约 40%, 质量几乎无损
+      OLLAMA_KV_CACHE_TYPE: "q8_0"
+
+      # 模型跨所有 GPU 分布 — 让第二张 4090 参与计算
+      OLLAMA_SCHED_SPREAD: "1"
+
+      # 最大并行请求数 — 2 个请求可以同时处理
+      OLLAMA_NUM_PARALLEL: "2"
+
+      # 最大同时加载模型数 — 允许主模型 + 回退模型同时驻留
+      OLLAMA_MAX_LOADED_MODELS: "2"
+
+    dns:
+      - 114.114.114.114
+      - 223.5.5.5
+      - 180.76.76.76
+    dns_opt:
+      - attempts:3
+      - timeout:2
+      - ndots:0
+    volumes:
+      - /root/deAI/infra/ollama/data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.10.2
+    container_name: ollama-webui
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - ollama
+    environment:
+      PORT: "8080"
+      OLLAMA_BASE_URL: "http://127.0.0.1:11434"
+      WEBUI_AUTH: "False"
+      # 用 Ollama 做 RAG 嵌入 (不再依赖 sentence-transformers)
+      RAG_EMBEDDING_ENGINE: "ollama"
+      RAG_EMBEDDING_MODEL: "nomic-embed-text:latest"
+      # 离线模式: 禁止从 HuggingFace 下载任何模型 (嵌入模型已经用 Ollama 本地提供)
+      OFFLINE_MODE: "true"
+      HTTPS_PROXY: "http://127.0.0.1:7890"
+      HTTP_PROXY: "http://127.0.0.1:7890"
+      # huggingface.co 必须直连, 走代理极慢
+      NO_PROXY: "127.0.0.1,localhost,ollama,open-webui,huggingface.co,*.huggingface.co"
+    volumes:
+      - openwebui_data:/app/backend/data
+      - webui_hf_cache:/app/backend/data/cache/huggingface
+
+volumes:
+  openwebui_data:
+  webui_hf_cache:

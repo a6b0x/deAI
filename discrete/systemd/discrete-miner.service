@@ -1,0 +1,57 @@
+# Discrete Headless Miner systemd service
+# Install:
+#   sudo cp /root/deAI/discrete/systemd/discrete-miner.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now discrete-miner.service
+#
+# Monitor:
+#   sudo systemctl status discrete-miner
+#   sudo journalctl -u discrete-miner -f
+
+[Unit]
+Description=Discrete Cash Daemon with Headless Mining
+Documentation=https://docs.discrete.cash/#/operators/mining
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+# Run as a non-privileged user for production. For now default to root.
+# User=discrete
+# Group=discrete
+
+WorkingDirectory=/root/deAI/discrete
+
+Environment="MINING_THREADS=0"
+Environment="P2P_PORT=9330"
+Environment="RPC_PORT=9331"
+Environment="P2P_BIND_IP=0.0.0.0"
+Environment="RPC_BIND_IP=127.0.0.1"
+Environment="LOG_LEVEL=2"
+
+ExecStart=/root/deAI/discrete/scripts/03-start-mining.sh --foreground \
+    --threads ${MINING_THREADS} \
+    --p2p-port ${P2P_PORT} \
+    --rpc-port ${RPC_PORT} \
+    --p2p-bind-ip ${P2P_BIND_IP} \
+    --rpc-bind-ip ${RPC_BIND_IP}
+
+# graceful stop
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=120
+KillMode=mixed
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+
+# Hardening (optional, uncomment if running as non-root discrete user)
+# NoNewPrivileges=true
+# ProtectSystem=strict
+# ReadWritePaths=/root/deAI/discrete
+# PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=discrete-miner
+
+[Install]
+WantedBy=multi-user.target

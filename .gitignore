@@ -1,0 +1,15 @@
+# 模型权重数据目录（两套方案各自独立，大文件不入库）
+/infra/ollama/data/
+/infra/vllm/data/
+
+# 敏感配置（含密码/公网IP，不入库）
+/infra/monitoring/monitoring.env
+
+# 钱包
+/discrete/wallet/
+
+# discrete 节点区块链数据（137M，不入库）
+/discrete/data/
+
+# 通用日志
+*.log
