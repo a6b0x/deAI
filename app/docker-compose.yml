@@ -1,0 +1,36 @@
+# =============================================================================
+# docker-compose.prod.yml — 服务器端 Solar 单进程部署
+# =============================================================================
+# 只需修改版本号 SOLAR_TAG 即可拉取最新代码 + 测试数据（数据已打包进镜像）。
+#
+# 用法（在服务器上）:
+#   export SOLAR_TAG=v1.2.0                 # 或直接写死 image 的 tag
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# 若要更新：
+#   export SOLAR_TAG=v1.3.0
+#   docker compose -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# 数据持久化：
+#   named volume solar_data 挂载到容器 /data。
+#   首次启动时自动从镜像内拷贝测试数据；后续数据保存在 volume，重启不丢失。
+# =============================================================================
+
+services:
+  server:
+    # 版本号通过环境变量 SOLAR_TAG 控制，默认 latest
+    image: ${REGISTRY_HOST:-127.0.0.1:5000}/solar-server:${SOLAR_TAG:-latest}
+    container_name: solar-server
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=file:/data/solar.db
+      - JWT_SECRET=${JWT_SECRET:-dev-secret-change-in-production}
+      - PORT=5001
+    volumes:
+      - solar_data:/data
+    ports:
+      - '5901:5001'
+
+volumes:
+  solar_data:
