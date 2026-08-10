@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly VERSION="0.2.0"
+
+# -----------------------------------------------------------------------------
+# pearl_hash：Pearl 挖矿运维入口脚本（唯一入口）
+#
+# 模块化设计：
+# - pearl_hash 入口：仅负责路径定义 + 公共函数 + 参数解析 + 命令分发（约 200 行）
+# - lib/common.sh       : 基础工具（日志、脱敏、路径解析、配置加载）
+# - lib/supervisor.sh   : 后台守护进程（拉起矿工、启动验证、自动重启、定时采样）
+# - lib/cmd_start.sh    : start 命令（预检 + flock + nohup 拉起 supervisor）
+# - lib/cmd_stop.sh     : stop / pause / resume / pre_run_llm 命令
+# - lib/cmd_status.sh   : status / config / logs 命令
+# - lib/cmd_metrics.sh  : metrics 命令（Prometheus 格式）
+# - lib/cmd_update.sh   : version / check-update / update 命令
+# - lib/health_check.sh : 健康检查 / 数据采样（API + 日志降级）
+# - lib/gpu_check.sh    : GPU 预检
+# - lib/logrotate.sh    : 日志轮转
+# - lib/version_check.sh: 版本检测 / 自更新基础能力
+# -----------------------------------------------------------------------------
+
+# 第一步：加载 common.sh（提供 pearl_hash_script_dir + 基础工具函数）
+source "$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+
+# 路径常量
+readonly SCRIPT_DIR="$(pearl_hash_script_dir)"
+readonly LIB_DIR="${SCRIPT_DIR}/lib"
+
+readonly BIN_DIR="${SCRIPT_DIR}/bin"
+readonly CONFIG_DIR="${SCRIPT_DIR}/config"
+readonly LOG_DIR="${SCRIPT_DIR}/logs"
+readonly RUN_DIR="${SCRIPT_DIR}/run"
+
+readonly ENV_FILE="${CONFIG_DIR}/.env"
+
+readonly LOG_FILE="${LOG_DIR}/miner.log"
+readonly STATS_FILE="${LOG_DIR}/stats.jsonl"
+
+readonly SUPERVISOR_PID_FILE="${RUN_DIR}/supervisor.pid"
+readonly MINER_PID_FILE="${RUN_DIR}/miner.pid"
+readonly START_LOCK_FILE="${RUN_DIR}/.start.lock"
+readonly MANUAL_STOP_FLAG="${RUN_DIR}/.manual_stop"
+
+# 第二步：按依赖顺序加载各模块
+# 注意：common.sh 已加载；health_check.sh 被 supervisor/cmd_status/cmd_metrics 依赖，先加载
+source "${LIB_DIR}/logrotate.sh"
+source "${LIB_DIR}/gpu_check.sh"
+source "${LIB_DIR}/health_check.sh"
+source "${LIB_DIR}/version_check.sh"
+source "${LIB_DIR}/supervisor.sh"
+source "${LIB_DIR}/cmd_start.sh"
+source "${LIB_DIR}/cmd_stop.sh"
+source "${LIB_DIR}/cmd_status.sh"
+source "${LIB_DIR}/cmd_metrics.sh"
+source "${LIB_DIR}/cmd_update.sh"
+
+# =============================================================================
+# 公共基础函数（需要引用路径常量，必须定义在入口脚本中）
+# =============================================================================
+
+pearl_hash_usage() {
+  cat <<'EOF'
+用法：
+  ./pearl_hash [全局参数] <命令> [命令参数]
+
+全局参数：
+  -y, --yes        跳过确认（用于 update/stop 等可能影响运行的操作）
+  --version        打印入口脚本版本号
+  -h, --help       打印帮助
+
+命令：
+  start                 启动（后台 supervisor + 预检 + 启动验证）
+  stop                  停止（优雅关闭：TERM→等待→KILL）
+  restart               重启（stop + start）
+  pause                 暂停挖矿（SIGSTOP）
+  resume                恢复挖矿（SIGCONT）
+  pre_run_llm           预留给跑 LLM：等同 pause，但输出更明确的提示/退出码
+  status [--brief]      状态（含 GPU 指标与算力快照；会触发一次轮转检查）
+  monitor [秒]           实时监控面板（默认每 5 秒刷新，Ctrl+C 退出）
+  config                打印当前生效配置（敏感字段脱敏）
+  logs [-f] [N]         查看日志（默认 tail -n 50；-f 跟随）
+  metrics               Prometheus 文本格式指标输出（适合 node_exporter textfile）
+  version               打印入口脚本 + 本地矿工版本 + 远程最新对比
+  check-update          仅检查是否有新版（不下载）
+  update [-y]           下载并安装最新矿工版本（会检查运行状态并要求确认）
+
+示例：
+  ./pearl_hash config
+  ./pearl_hash start
+  ./pearl_hash status --brief
+  ./pearl_hash logs 200
+  ./pearl_hash -y update
+EOF
+}
+
+pearl_hash_confirm() {
+  local prompt="$1"
+  local yes="${2:-false}"
+  if [[ "$yes" == "true" ]]; then
+    return 0
+  fi
+  read -r -p "${prompt} [y/N]: " ans || true
+  case "${ans:-}" in
+  y|Y|yes|YES) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+pearl_hash_ensure_dirs() {
+  pearl_hash_mkdirp "$BIN_DIR"
+  pearl_hash_mkdirp "$CONFIG_DIR"
+  pearl_hash_mkdirp "$LOG_DIR"
+  pearl_hash_mkdirp "$RUN_DIR"
+}
+
+pearl_hash_disk_space_warn() {
+  local min_mb="${1:-500}"
+  pearl_hash_is_number "$min_mb" || min_mb="500"
+  if ! command -v df >/dev/null 2>&1; then
+    return 0
+  fi
+  local avail_mb
+  avail_mb="$(df -Pm -- "$LOG_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+  [[ "$avail_mb" =~ ^[0-9]+$ ]] || return 0
+  if (( avail_mb < min_mb )); then
+    pearl_hash_warn "磁盘空间偏低：logs 分区剩余 ${avail_mb}MB（阈值 ${min_mb}MB）。建议清理日志或扩容，避免写满磁盘。"
+  fi
+}
+
+pearl_hash_is_pid_running() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+pearl_hash_read_pid_file() {
+  local pid_file="$1"
+  [[ -f "$pid_file" ]] || return 1
+  local pid
+  pid="$(cat -- "$pid_file" 2>/dev/null || true)"
+  pid="$(pearl_hash_trim "$pid")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$pid"
+}
+
+pearl_hash_write_pid_file_atomic() {
+  local pid_file="$1"
+  local pid="$2"
+  local tmp="${pid_file}.tmp"
+  printf '%s\n' "$pid" >"$tmp"
+  mv -f -- "$tmp" "$pid_file"
+}
+
+pearl_hash_cleanup_stale_pid_file() {
+  local pid_file="$1"
+  local pid
+  pid="$(pearl_hash_read_pid_file "$pid_file" 2>/dev/null || true)"
+  if [[ -n "$pid" ]] && ! pearl_hash_is_pid_running "$pid"; then
+    rm -f -- "$pid_file"
+  fi
+}
+
+pearl_hash_load_config() {
+  pearl_hash_load_env_file_if_unset "$ENV_FILE"
+
+  POOL_HOST="${POOL_HOST:-pool.pearlhash.xyz:9000}"
+  POOL_REGION="${POOL_REGION:-EU/US}"
+  STRATUM_PREFIX_AUTO="${STRATUM_PREFIX_AUTO:-true}"
+  USER_ADDRESS="${USER_ADDRESS:-}"
+  WORKER_NAME="${WORKER_NAME:-$(hostname)}"
+  NETWORK_HINT="${NETWORK_HINT:-}"
+
+  MINER_FLAVOR="${MINER_FLAVOR:-wildrig}"
+  MINER_BIN_NAME="${MINER_BIN_NAME:-}"
+  WILDRIG_ALGO="${WILDRIG_ALGO:-pearlhash}"
+  WILDRIG_PRINT_TIME="${WILDRIG_PRINT_TIME:-30}"
+  WILDRIG_API_PORT="${WILDRIG_API_PORT:-4058}"
+  WILDRIG_WATCHDOG="${WILDRIG_WATCHDOG:-true}"
+  AUTO_VERSION_CHECK_ON_START="${AUTO_VERSION_CHECK_ON_START:-true}"
+  UPDATE_SOURCE="${UPDATE_SOURCE:-auto}"
+
+
+  GPU_DEVICES="${GPU_DEVICES:-}"
+  MAX_GPU_TEMP="${MAX_GPU_TEMP:-85}"
+  GPU_STRICT_EXCLUSIVE="${GPU_STRICT_EXCLUSIVE:-false}"
+  GPU_IGNORE_PROCS="${GPU_IGNORE_PROCS:-dcgm-exporter,nvidia-cuda-mps-control,Xorg}"
+
+  LOG_MAX_SIZE_MB="${LOG_MAX_SIZE_MB:-50}"
+  LOG_ROTATE_KEEP="${LOG_ROTATE_KEEP:-7}"
+  LOG_COMPRESS="${LOG_COMPRESS:-true}"
+  LOG_STATS_JSONL="${LOG_STATS_JSONL:-true}"
+  LOG_RUNTIME_CHECK_INTERVAL="${LOG_RUNTIME_CHECK_INTERVAL:-3600}"
+  LOG_STATS_INTERVAL="${LOG_STATS_INTERVAL:-60}"
+
+  AUTO_RESTART="${AUTO_RESTART:-true}"
+  AUTO_RESTART_MAX_RETRIES="${AUTO_RESTART_MAX_RETRIES:-5}"
+  AUTO_RESTART_DELAY_SEC="${AUTO_RESTART_DELAY_SEC:-5}"
+  STARTUP_VERIFY_TIMEOUT_SEC="${STARTUP_VERIFY_TIMEOUT_SEC:-30}"
+  STARTUP_VERIFY_KEYWORD_WILDRIG="${STARTUP_VERIFY_KEYWORD_WILDRIG:-new job from}"
+  STARTUP_VERIFY_KEYWORD_PEARL="${STARTUP_VERIFY_KEYWORD_PEARL:-Hashrate Total}"
+  if [[ -z "${STARTUP_FAIL_KEYWORDS+x}" ]]; then
+    STARTUP_FAIL_KEYWORDS=("FATAL" "Startup error" "failed to create CUDA context")
+  fi
+
+  POOL_DNS_CHECK="${POOL_DNS_CHECK:-true}"
+  POOL_TCP_CHECK="${POOL_TCP_CHECK:-true}"
+  POOL_TCP_TIMEOUT_SEC="${POOL_TCP_TIMEOUT_SEC:-5}"
+
+  MIN_DISK_SPACE_MB="${MIN_DISK_SPACE_MB:-500}"
+
+  if [[ -z "${MINER_BIN_NAME:-}" ]]; then
+    if [[ "$MINER_FLAVOR" == "pearl" ]]; then
+      MINER_BIN_NAME="pearl-miner"
+    else
+      MINER_BIN_NAME="wildrig-multi"
+    fi
+  fi
+}
+
+pearl_hash_miner_bin() {
+  printf '%s' "${BIN_DIR}/${MINER_BIN_NAME}"
+}
+
+pearl_hash_pool_host_port() {
+  local pool="$1"
+  local host="$pool"
+  local port=""
+  if [[ "$pool" == *":"* ]]; then
+    host="${pool%:*}"
+    port="${pool##*:}"
+  fi
+  printf '%s %s' "$host" "$port"
+}
+
+pearl_hash_check_pool_connectivity() {
+  local pool="$1"
+  local dns_check="$2"
+  local tcp_check="$3"
+  local tcp_timeout="${4:-5}"
+  local network_hint="${5:-}"
+
+  local host port
+  read -r host port <<<"$(pearl_hash_pool_host_port "$pool")"
+  host="$(pearl_hash_trim "$host")"
+  port="$(pearl_hash_trim "$port")"
+
+  if [[ "$dns_check" == "true" ]]; then
+    if command -v getent >/dev/null 2>&1; then
+      if ! getent hosts "$host" >/dev/null 2>&1; then
+        pearl_hash_warn "DNS 解析失败：${host}（你仍可尝试直接 start，但大概率无法连接矿池）"
+        [[ -n "$network_hint" ]] && pearl_hash_warn "$network_hint"
+      fi
+    else
+      pearl_hash_warn "缺少 getent，跳过 DNS 检查"
+    fi
+  fi
+
+  if [[ "$tcp_check" == "true" && -n "$port" ]]; then
+    if command -v nc >/dev/null 2>&1; then
+      if ! nc -z -w "$tcp_timeout" "$host" "$port" >/dev/null 2>&1; then
+        pearl_hash_warn "TCP 连通性检查失败：${host}:${port}"
+        [[ -n "$network_hint" ]] && pearl_hash_warn "$network_hint"
+      fi
+      return 0
+    fi
+
+    if command -v timeout >/dev/null 2>&1; then
+      if ! timeout "${tcp_timeout}s" bash -c "cat </dev/null >/dev/tcp/${host}/${port}" >/dev/null 2>&1; then
+        pearl_hash_warn "TCP 连通性检查失败：${host}:${port}"
+        [[ -n "$network_hint" ]] && pearl_hash_warn "$network_hint"
+      fi
+      return 0
+    fi
+
+    pearl_hash_warn "缺少 nc/timeout，跳过 TCP 连通性检查"
+  fi
+}
+
+pearl_hash_build_miner_cmd() {
+  local miner_flavor="$1"
+  local pool_host="$2"
+  local user_address="$3"
+  local worker_name="$4"
+  local gpu_devices_csv="$5"
+
+  local miner_bin
+  miner_bin="$(pearl_hash_miner_bin)"
+
+  if [[ "$miner_flavor" == "pearl" ]]; then
+    PEARL_HASH_MINER_CMD=(
+      "$miner_bin"
+      --pool "$pool_host"
+      --user "$user_address"
+      --worker "$worker_name"
+    )
+    return 0
+  fi
+
+  local url="$pool_host"
+  if [[ "${STRATUM_PREFIX_AUTO}" == "true" && "$url" != stratum* ]]; then
+    url="stratum+tcp://${url}"
+  fi
+
+  PEARL_HASH_MINER_CMD=(
+    "$miner_bin"
+    -a "$WILDRIG_ALGO"
+    -o "$url"
+    -u "$user_address"
+    -w "$worker_name"
+    -p x
+  )
+
+  if [[ -n "${WILDRIG_PRINT_TIME:-}" && "${WILDRIG_PRINT_TIME}" != "0" ]]; then
+    PEARL_HASH_MINER_CMD+=(--print-time "$WILDRIG_PRINT_TIME")
+  fi
+
+  if [[ -n "${gpu_devices_csv:-}" ]]; then
+    PEARL_HASH_MINER_CMD+=(--gpu-list "$gpu_devices_csv")
+  fi
+
+  if [[ -n "${MAX_GPU_TEMP:-}" ]]; then
+    PEARL_HASH_MINER_CMD+=(--gpu-temp-limit "$MAX_GPU_TEMP")
+  fi
+
+  if [[ "${WILDRIG_WATCHDOG}" == "true" ]]; then
+    PEARL_HASH_MINER_CMD+=(--watchdog)
+  fi
+
+  if [[ -n "${WILDRIG_API_PORT:-}" && "${WILDRIG_API_PORT}" != "0" ]]; then
+    PEARL_HASH_MINER_CMD+=(--api-port "$WILDRIG_API_PORT")
+  fi
+}
+
+pearl_hash_cmd_to_pretty_string() {
+  local -a cmd=("$@")
+  local out=""
+  local part
+  for part in "${cmd[@]}"; do
+    out+=$(printf ' %q' "$part")
+  done
+  pearl_hash_trim "$out"
+}
+
+pearl_hash_rotate_miner_log_if_needed() {
+  pearl_hash_disk_space_warn "$MIN_DISK_SPACE_MB"
+  pearl_hash_rotate_logs "$LOG_FILE" "$LOG_MAX_SIZE_MB" "$LOG_ROTATE_KEEP" "$LOG_COMPRESS" || true
+}
+
+# =============================================================================
+# 入口：参数解析 + 命令分发
+# =============================================================================
+
+main() {
+  local yes="false"
+  local cmd=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    -y|--yes)
+      yes="true"
+      shift
+      ;;
+    --version)
+      echo "$VERSION"
+      return 0
+      ;;
+    -h|--help)
+      pearl_hash_usage
+      return 0
+      ;;
+    __supervisor)
+      shift
+      pearl_hash_supervisor_main
+      return 0
+      ;;
+    -*)
+      pearl_hash_err "未知参数：$1"
+      pearl_hash_usage
+      return 1
+      ;;
+    *)
+      cmd="$1"
+      shift
+      break
+      ;;
+    esac
+  done
+
+  case "${cmd:-}" in
+  start) pearl_hash_cmd_start ;;
+  stop) pearl_hash_cmd_stop "$yes" ;;
+  restart)
+    pearl_hash_cmd_stop "$yes" || true
+    pearl_hash_cmd_start
+    ;;
+  pause) pearl_hash_cmd_pause ;;
+  resume) pearl_hash_cmd_resume ;;
+  pre_run_llm) pearl_hash_cmd_pre_run_llm ;;
+  status)
+    if [[ "${1:-}" == "--brief" ]]; then
+      pearl_hash_cmd_status "true"
+    else
+      pearl_hash_cmd_status "false"
+    fi
+    ;;
+  monitor)
+    pearl_hash_cmd_monitor "${1:-5}"
+    ;;
+  config) pearl_hash_cmd_config ;;
+  logs) pearl_hash_cmd_logs "$@" ;;
+  metrics) pearl_hash_cmd_metrics ;;
+  version) pearl_hash_cmd_version ;;
+  check-update) pearl_hash_cmd_check_update ;;
+  update) pearl_hash_cmd_update "$yes" ;;
+  ""|help) pearl_hash_usage ;;
+  *)
+    pearl_hash_err "未知命令：${cmd}"
+    pearl_hash_usage
+    return 1
+    ;;
+  esac
+}
+
+main "$@"
