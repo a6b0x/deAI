@@ -323,6 +323,9 @@ pearl_hash_build_miner_cmd() {
   if [[ -n "${MAX_GPU_TEMP:-}" ]]; then
     PEARL_HASH_MINER_CMD+=(--gpu-temp-limit "$MAX_GPU_TEMP")
   fi
+  if [[ -n "${MAX_GPU_TEMP_RESUME:-}" ]]; then
+    PEARL_HASH_MINER_CMD+=(--gpu-temp-resume "$MAX_GPU_TEMP_RESUME")
+  fi
 
   if [[ "${WILDRIG_WATCHDOG}" == "true" ]]; then
     PEARL_HASH_MINER_CMD+=(--watchdog)
