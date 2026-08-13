@@ -1,4 +1,4 @@
-# Pearl (PRL) 双矿工对比：GPU 0 跑 PeakMiner，GPU 1 跑 ForgeMiner。
+# Pearl (PRL) 双矿工对比（第二轮交叉验证）：GPU 1 跑 PeakMiner，GPU 0 跑 ForgeMiner。
 # 两者均为 PPS+ 模式、同一钱包、同一全球节点，矿池后台按 worker（peak/forge）分别统计。
 # 用法：docker compose up -d | down | logs -f peakminer
 #
@@ -31,7 +31,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["0"]
+              device_ids: ["1"]
               capabilities: [gpu]
     # 折叠块标量：与 docker run 命令行写法一致
     command: >
@@ -62,7 +62,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["1"]
+              device_ids: ["0"]
               capabilities: [gpu]
     # ForgeMiner 无日志文件参数，用 tee 把 stdout 同时写入文件。
     # 注意：command 必须是单元素列表——字符串形式会被 compose 按空格拆分，
