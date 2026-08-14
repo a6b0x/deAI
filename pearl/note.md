@@ -48,3 +48,32 @@
 - [ ] 第二轮跑满 24h 后取矿池 24h 均值，两轮交叉平均得出真实软件效率差
 - [ ] 关注 GPU 1 散热（85°C+、风扇 100%），长期热降频两张卡都吃亏
 - [ ] 确认矿池"挖矿软件已过时"提示消除
+
+---
+
+## 故障记录（2026-08-14）：ForgeMiner 断连 5h+
+
+- **现象**：矿池后台 worker `forge` 最后活跃 2026-08-14 05:29:48（UTC），GPU 0 空转。
+- **时间线**（日志 `logs/forge.log`，UTC）：
+  - 08-13 21:29:48 最后一次 share accepted
+  - 21:29:57 `disconnected (pool closed the connection)` → 重连 7048 后矿池要求切 TLS，
+    但 `TLS connect failed: unexpected end of file`，自此死循环重试约 5 小时。
+- **根因**：矿池明文端口 `prl.kryptex.network:7048` 已失效——openssl 验证 7048 的
+  明文/TLS 均直接 EOF，而 8048 的 TLSv1.3 握手正常（PeakMiner 一直用它，未受影响）。
+- **修复**：`docker-compose.yml` 中 forge 的 `--pool` 由 `prl.kryptex.network:7048`
+  改为 `ssl://prl.kryptex.network:8048`，`docker compose up -d forgeminer` 重建后
+  恢复（282 TH/s，share accepted 正常）。两矿工现同端口 8048，端口差异变量消除。
+- **教训**：forge 对明文端口挂掉无自愈能力（TLS 握手 EOF 会无限重试），宜用多池
+  failover 写法 `--pool ssl://...:8048,ssl://...:8048` 或加监控告警。
+
+## 更新记录（2026-08-14）：ForgeMiner v1.5.13 → v1.5.15
+
+- 矿池提示"挖矿软件已过时"，检查 Docker Hub 发现远程 `latest`（digest `a3912d8d`）
+  于 08-14 00:19 UTC 推送，本地还是 26h 前旧版（digest `382eb68e`）。
+- 升级流程（`latest` tag 无需删镜像）：
+  1. `docker compose pull forgeminer` — 拉取新 latest
+  2. `docker compose up -d forgeminer` — digest 变化自动重建容器
+  3. 验证 `forge --version` = 1.5.15、share accepted 正常（274 TH/s）
+  4. `docker image prune -f` — 清理旧版 dangling 镜像（回收 68MB）
+- 注意：**不能先 `docker rmi hashraptor/forge:latest` 再重启**——运行中容器正引用
+  该 tag 会被拒绝，强删 `-f` 会弄坏运行中的容器。正确顺序永远是 pull → up → prune。

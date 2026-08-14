@@ -67,6 +67,8 @@ services:
     # ForgeMiner 无日志文件参数，用 tee 把 stdout 同时写入文件。
     # 注意：command 必须是单元素列表——字符串形式会被 compose 按空格拆分，
     # 导致 sh -c 只执行第一个词、其余变成位置参数。
+    # 2026-08-14 故障修复：矿池明文端口 7048 已失效（重连时要求 TLS 但握手 EOF，
+    # forge 死循环 TLS connect failed），改用已验证正常的 SSL 端口 8048（与 PeakMiner 同端口）。
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - "/opt/forge/entrypoint.sh --algorithm pearlhash --pool prl.kryptex.network:7048 --wallet prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl --worker forge --api 2>&1 | tee -a /var/log/forge/forge.log"
+      - "/opt/forge/entrypoint.sh --algorithm pearlhash --pool ssl://prl.kryptex.network:8048 --wallet prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl --worker forge --api 2>&1 | tee -a /var/log/forge/forge.log"
