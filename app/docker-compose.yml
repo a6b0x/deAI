@@ -27,6 +27,7 @@ services:
       - DATABASE_URL=file:/data/solar.db
       - JWT_SECRET=${JWT_SECRET:-dev-secret-change-in-production}
       - PORT=5001
+      - NODE_ENV=production
     volumes:
       - solar_data:/data
     ports:
