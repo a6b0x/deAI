@@ -154,7 +154,8 @@ for file in "${FILES[@]}"; do
   if [ -f "${dest}" ] && [ -s "${dest}" ]; then
     if [[ "${file}" == *.safetensors ]]; then
       local_size=$(stat -c%s "${dest}")
-      remote_size=$(get_remote_size "${file}")
+      # 去除 \r，避免 HuggingFace Content-Range 头含回车导致整数比较失败
+      remote_size=$(get_remote_size "${file}" | tr -d '\r')
       if [ -z "${remote_size}" ]; then
         echo "    已存在 (大小 $(du -h "${dest}" | cut -f1))，跳过 (远端大小无法获取)"
         continue

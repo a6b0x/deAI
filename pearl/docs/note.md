@@ -1,682 +1,373 @@
-# 资料参考
+# Pearl 运维
 
-## 官方链接
-
-| 资源 | URL |
-|------|-----|
-| Kryptex 矿池（Pearl） | `https://pool.kryptex.com/zh-cn/prl` |
-| KRig（Kryptex 开发，0% devfee） | `https://github.com/kryptex/krig-miner` |
-| SRBMiner-MULTI | `https://github.com/doktor83/SRBMiner-MULTI` |
-| PeakMiner | `https://github.com/peakminer/PeakMiner` |
-| ForgeMiner | `https://github.com/0xHashRaptor/ForgeMiner` |
-| ARCMiner | `https://github.com/arcminer/ARCMiner` |
-| Fl4shMiner | `https://github.com/fl4shminer/Fl4shMiner` |
-| Pearl Desktop Wallet | Pearl 官方钱包 |
-
-## 矿池基本信息
-
-| 项目 | 内容 |
-|------|------|
-| 算法 | PearlHash |
-| 矿池算力 | 4.37 EH/s |
-| 矿工数 | 3,322 |
-| 最低支付 | 1 PRL |
-| PPS+ 费率 | 2% |
-| SOLO 费率 | 1% |
-
-## 连接地址
-
-| 区域 | 地址 |
-|------|------|
-| 全球 | `prl.kryptex.network:7048` |
-| 欧洲 | `prl-eu.kryptex.network:7048` |
-| 北美 | `prl-us.kryptex.network:7048` |
-| 南美 | `prl-br.kryptex.network:7048` |
-| 新加坡 | `prl-sg.kryptex.network:7048` |
-| 中国（香港） | `prl-hk.kryptex.network:7048` |
-| 俄罗斯 | `prl-ru.kryptex.network:7048` |
-| 中东 | `prl-ae.kryptex.network:7048` |
-
-> 钱包格式：`wallet/worker` 或 `username/worker`
-> SOLO 挖矿格式：`solo:wallet`
-
-## 矿工选型速查
-
-| 矿工 | 版本要求 | 适用场景 | Devfee | 备注 |
-|------|---------|---------|--------|------|
-| **PeakMiner**（Docker 首选） | ≥ 2.9.0 | NVIDIA sm_60+ / AMD RDNA 1+（Pearl 仅 NVIDIA sm_75+） | **2%** | 官方 Docker 镜像，算力最高 |
-| **ForgeMiner**（Docker 备选） | latest | NVIDIA 全系（Pascal → Blackwell + Hopper） | **2%** | 官方 Docker 镜像 `hashraptor/forge`，闭源，CUDA Driver API 原生实现 |
-| **KRig**（二进制首选） | ≥ 1.2.0 | AMD RDNA 2/3/4、CDNA 4、NVIDIA RTX 2000-5000 | **0%** | Kryptex 官方开发，gzip 压缩 |
-| **SRBMiner-MULTI** | ≥ 3.5.3 | AMD / NVIDIA 通用 | 约 1-2%（视算法） | 老牌矿工，社区活跃 |
-| **ARCMiner** | ≥ 0.3.1 | AMD / NVIDIA 通用 | 未注明 | 较新的矿工 |
-| **Fl4shMiner** | ≥ 1.2.7 | AMD / NVIDIA 通用 | 未注明 | — |
-
-> ⚠️ **重要**：Pearl 团队已更改算法，必须升级矿工程序到指定版本以上，旧版软件将提交 **100% 无效份额**。
-
-### 选型建议
-
-| 对比维度 | PeakMiner（Docker） | KRig（二进制） |
-|---------|---------------------|----------------|
-| 部署难度 | ⭐ 一行 `docker run` | ⭐⭐ 需下载 + 解压 |
-| Devfee | **2%** | **0%** |
-| 4090 算力 | **291.2 TH/s** | ~254 TH/s |
-| 5090 算力 | **376.2 TH/s** | ~335 TH/s |
-| 矿池流量 | 无压缩 | gzip 压缩，减少 **80%** |
-| 开发者 | 第三方（peakminer） | Kryptex 官方 |
-| 运维特性 | Docker 原生重启策略 | 需自行配 nohup / systemd |
-| API 监控 | ✅ `--api-port 4068` | ✅ `--api-port` |
-| GPU 超频 | ✅ 内置参数 | ❌ 需外部工具 |
-| GPU 兼容 | NVIDIA sm_75+ (RTX 20xx+)、AMD 仅 CSD/ALP | AMD RDNA 2/3/4 + NVIDIA RTX 2000-5000 |
-
-**结论**：两者各有优势，按需选择：
-
-- **追求省心 + 高算力** → **PeakMiner Docker**：4090 算力比 KRig 高约 15%（291 vs 254 TH/s），但 devfee 2%。一行命令部署，Docker 自动重启，适合不想折腾的场景
-- **追求 0% devfee + 省流量** → **KRig 二进制**：每 100 PRL 收益多拿 2 PRL，gzip 压缩省 80% 流量。适合长期跑、带宽受限的场景
-- **老卡用户（GTX 16xx 等）** → **SRBMiner-MULTI**：Pearl 对 GPU 架构有要求，PeakMiner 需 sm_75+，KRig 需 RTX 2000+，老卡只能用 SRBMiner
+围绕 Pearl 双矿工实验的运维记录：矿机停机排查、Forge 软件升级、镜像更新自动化讨论。
 
 ---
 
-# 当前部署（2026-08-12：Docker Compose 双矿工对比）
+## 双矿工合并为单进程双卡：PeakMiner -d / Forge --gpu 260817
 
-本机两张 RTX 4090 分别运行 PeakMiner 和 ForgeMiner 进行实测对比，由 `/root/deAI/pearl/docker-compose.yml` 统一管理：
+> 问题：`peakminer-0/1`、`forgeminer-0/1` 四个容器能否合并？
 
-| | GPU 0 | GPU 1 |
-|---|---|---|
-| 矿工 | PeakMiner v2.9.0 | ForgeMiner（latest） |
-| 容器 | `kryptex-prl-peakminer` | `kryptex-prl-forgeminer` |
-| 镜像 | `peakminer/peakminer:latest` | `hashraptor/forge:latest` |
-| 矿池 | `prl.kryptex.network:8048`（SSL） | `prl.kryptex.network:7048`（TCP） |
-| Worker | `.../peak` | `.../forge` |
-| Devfee | 2% | 2% |
-| 文件日志 | `pearl/logs/miner.log` | `pearl/logs/forge.log`（tee 落盘） |
-| 监控 API | `http://127.0.0.1:4068/summary` | `http://127.0.0.1:7777/summary`（另有 `/metrics` Prometheus 端点） |
+**结论：两个矿工均原生支持单进程多卡，各合并为一个容器绑双卡（`device_ids: ["0","1"]`）。**
 
-对比口径：两者均为 PPS+ 模式、同一钱包、同一全球节点，**以矿池后台按 worker（peak/forge）统计的 24h 平均收益为准**。注意 GPU 1 本身散热较差（温度比 GPU 0 高约 8°C），长时间对比后可交换两卡的矿工再测一轮消除体质/散热影响。
+- **为什么不走 compose `--scale`**：scale 副本无法差异化——GPU 绑定、API 端口、worker 名、日志卷全是实例间必须不同的项，host 网络下端口必撞（4068/4069、7777/7778）
+- **关键参数差异**：PeakMiner 用 `-d 0,1`（默认 all）；ForgeMiner 用 `--gpu 0,1`（**注意是 `--gpu` 而非 `--devices`**，对应环境变量 `FORGE_GPU`）
+- **worker / API / 日志变更**：`peak0/peak1`、`forge0/forge1` → `peak`、`forge`（矿池按 worker 合并统计双卡合计）；API `4068/4069`、`7777/7778` → `4068`、`7777`；日志 `logs/peak0|peak1`、`logs/forge0|forge1` → `logs/peak`、`logs/forge`
+- **compose 字符串命令坑**：两镜像 entrypoint 均非 shell（PeakMiner 为二进制 `peakminer`，Forge 为 `/opt/forge/entrypoint.sh`），command 写字符串必须配 `entrypoint: ["/bin/sh", "-c"]`，否则整串被当单个参数传错；PeakMiner 字符串写法用 `exec` 前缀让 miner 成为容器 1 号进程，SIGTERM/restart 信号直达（不影响 `restart: unless-stopped`）
+- **锚点精简**：删除 `x-gpu0`/`x-gpu1`，统一 `x-gpu-all`
+- **待办**：旧日志目录 `logs/peak0|peak1`、`logs/forge0|forge1` 可清理；`docs/ref.md` "当前部署"章节仍是旧双容器描述，需同步
 
-**首轮实测（2026-08-12，无超频）**：PeakMiner 288.2 TH/s（641.8 GH/W） vs ForgeMiner 278.9~282 TH/s（621.1 GH/W），PeakMiner 高约 3%，能效略优，两者 0 拒绝。
+---
 
-**常用命令**：
+## Forge 无限重启根因：GPU0 显存被 vLLM 抢占 260817
+
+> 现象：`kryptex-prl-forgeminer` 状态 `Restarting (0)`，`forge.log` 每约 1 分钟循环一次：banner → `GPU0: low-VRAM mode (0.9/23.5 GB free)` → `[mining gpu0] fatal: CUDA driver error 2 @ (self.alloc)` → 进程退出被 restart 拉起。同期 PeakMiner 正常。
+
+**根因链**：`vllm-coder`（vLLM，TP=2）启动后占用 GPU 0 达 **22236MiB / 24564MiB**，只剩 0.9GB → forge 容器绑定 `device_ids: ["0"]` 启动，分配显存失败（CUDA error 2 = `cudaErrorMemoryAllocation`）→ 崩溃 → `restart: unless-stopped` 自动拉起 → 显存仍不足 → 无限循环。
+
+**为什么 PeakMiner 没事**：它绑定 GPU 1，vLLM 在该卡也占 22236MiB，但剩余 ~1.3GB 恰好 ≥ PeakMiner 实际占用 1394MiB，得以存活。
+
+**关键数据修正**：forge 正常模式实际需要 **~9.2GB 显存**（此前误估 1.4-2GB，那是 PeakMiner 的用量）；PeakMiner 仅 **~1.4GB**。矿机显存需求差异巨大，规划 GPU 时不能混用。
+
+**`Restarting (0)` 假象**：forge 的 entrypoint 是 `sh -c "... forge ... 2>&1 | tee -a forge.log"`，`sh -c` 返回管道**最后一个命令** `tee` 的退出码（0），掩盖了 forge 的真实崩溃码，看起来像"正常退出又被拉起"，实为崩溃死循环。
+
+**排障教训**：
+
+- 容器无限重启先看 `nvidia-smi --query-compute-apps` 查每进程显存占用，GPU 资源冲突优先于软件故障排查
+- `Restarting (0)` 不代表进程正常退出，先确认 entrypoint 是否经过管道/包装命令
+
+---
+
+## Forge 与 vLLM 无法共存于单卡：28.8GB > 24GB，双卡全 forge 须先停 vLLM 260817
+
+> 问题：vLLM（TP=2）与 forge（绑定 GPU 0）同机运行时 forge 必崩。能否调 vLLM 显存参数让两者共存？
+
+**结论：物理装不下，只能二选一或用双卡各自隔离。**
+
+- 账：vLLM TP=2 每卡需 **19.6GB**（0.80 × 24GB）+ forge **9.2GB** = **28.8GB > 24GB** 单卡上限
+- 即便把 `--gpu-memory-utilization` 从 0.90 降到 0.80（每卡 19.6GB，KV cache 10.22GiB、223K tokens，验证可用），GPU 0 仍只剩 ~4.26GB，仍装不下 forge
+
+**vLLM 启动显存检查机制**（关键行为）：vLLM 初始化时要求 GPU **free ≥ utilization × total**，不满足直接报 `ValueError: Free memory on device cuda:0 (...) is less than desired GPU memory utilization` 并重启循环。故 vLLM 与显存大户共存时，谁先启动决定谁成功。
+
+**三方案权衡**（2026-08-17 评估）：
+
+
+| 方案                                                       | 改动                                               | 结果                                   |
+| ---------------------------------------------------------- | -------------------------------------------------- | -------------------------------------- |
+| A. vLLM 改 TP=1 独占 GPU0，forge 挪 GPU1                   | vLLM 单卡 ~20GB；GPU1 装 peakminer+forge 共 10.6GB | 可行，vLLM 速度约减半                  |
+| B. vLLM 保持 TP=2，utilization 降到 ~0.55 与 forge 挤 GPU0 | KV cache 仅 ~4GB/卡                                | 64K 上下文不可用，启动顺序脆弱，不推荐 |
+| C. 停 forge，vLLM 双卡全速                                 | forge 下线                                         | 最简单，但矿机只剩 peakminer           |
+
+**当前状态（已执行 C 的变体）**：用户停掉整个 pearl（双矿工），vLLM 保持 TP=2 + utilization 0.80 恢复运行。当前双卡各剩 ~4.26GB → **双 peakminer（各 1.4GB）可跑；双 forge（各 9.2GB）必须先停 vllm-coder**。
+
+---
+
+## 双卡矿工双模式切换：compose profiles 一键 peak/forge 260817
+
+`/root/deAI/pearl/docker-compose.yml` 重构为 profiles 双模式，整机可一键切换两种矿工组合：
+
+
+| 模式      | 命令                                   | 服务                            | GPU 绑定      |
+| --------- | -------------------------------------- | ------------------------------- | ------------- |
+| **peak**  | `docker compose --profile peak up -d`  | `peakminer-0` / `peakminer-1`   | GPU 0 / GPU 1 |
+| **forge** | `docker compose --profile forge up -d` | `forgeminer-0` / `forgeminer-1` | GPU 0 / GPU 1 |
+
+**切换命令**：`docker compose down && docker compose --profile forge up -d`
+
+设计要点：
+
+- worker 命名区分双卡：`peak0`/`peak1`、`forge0`/`forge1`，矿池后台可分别统计
+- host 网络下 API 端口必须区分：PeakMiner `--api-port 4068`/`4069`；Forge 用 `--api-bind 127.0.0.1:7777`/`7778`
+- 日志目录分离：`logs/peak0`、`logs/peak1`、`logs/forge0`、`logs/forge1`
+- 切换必须 `down` 再 `up`：profiles 不会自动停另一模式的服务；容器名带 `-0/-1` 后缀，与旧单容器名不同，首次切换 `down` 会清理旧容器
+- forge 保留 `ssl://8048` 配置（7048 明文已被矿池停用）与 tee 落盘
+
+---
+
+## Forge 明文 7048 被矿池停用致停挖，改 ssl://8048 恢复 260814
+
+> 控制台看到其中一台矿机停了，最后活跃时间是 2026/08/14 05:29:48，worker 是 forge。为什么停的是这台？另一台 PeakMiner 为什么没事？它之前明明是正常挖的，为什么偏偏在这个时间点开始不正常？到底是矿池的问题，还是 ForgeMiner 程序的 BUG？
+
+这是**单点失效 + 时间突变 + 协议差异**的复合问题。要解释清楚，必须同时回答四个子问题：
+
+1. **系统状态**：故障时两个 worker 的真实运行状态是什么？（进程活着 vs GPU 空转）
+2. **对比差异**：ForgeMiner 和 PeakMiner 在连接矿池的方式上有何不同？（端口/协议）
+3. **触发条件**：为什么故障发生在 08-13 21:29:57（UTC 05:29:48）这个时间点？是客户端主动行为还是服务端行为变化？
+4. **根因归属**：事件本质是矿池服务端变更、网络问题、还是 ForgeMiner 客户端的容错缺陷？
+
+现象与证据
+
+![矿池后台显示挖矿软件已过时，第一轮 peak/forge 统计](./Screenshot%202026-08-13%20at%2010.53.42.png)
+
+> 图：Kryptex 矿池后台 2026-08-13 10:53 截图。第一轮配置下 `peak` 跑 PeakMiner v2.9.0，`forge` 跑 ForgeMiner v1.5.11，均提示"挖矿软件已过时"。这预示矿池侧可能正在推动协议/版本升级。
+
+故障现场：
+
+
+| 检查项              | ForgeMiner (GPU 0)                                     | PeakMiner (GPU 1) |
+| ------------------- | ------------------------------------------------------ | ----------------- |
+| 容器状态            | `Up 23 hours`                                          | `Up 23 hours`     |
+| GPU 利用率          | **0%**                                                 | 99%               |
+| GPU 温度/功耗       | **27°C / 25W**                                        | 85°C / 439W      |
+| 最后 share accepted | 08-13 21:29:48                                         | 正常持续          |
+| 日志关键错误        | `TLS connect failed: unexpected end of file` × 907 次 | 无异常            |
+
+
+
+分析框架：MECE 排除 + 5 Whys
+
+第一步：先排除"机器/硬件/驱动"类根因
+
+- **GPU 0 利用率 0%、温度 27°C、功耗 25W**，说明 GPU 并未在计算，问题在"上游"（网络/协议/矿池）。
+- 如果是驱动崩溃或 CUDA 错误，通常会看到 `GPU error`、`CUDA out of memory` 或容器退出；此处没有。
+- 如果是显卡硬件故障，通常表现为持续降频或完全不可用，不会正好在收到一次 `disconnected` 后 neatly 停止出块。
+
+→ **结论**：不是本地硬件/驱动问题。
+
+
+
+第二步：对比两个 worker 的协议差异
+
+这是最关键的分层。两台矿机**同一台物理机、同一网络、同一钱包、同一矿池域名**，唯一不同是配置：
+
+
+| 维度     | PeakMiner                    | ForgeMiner                     |
+| -------- | ---------------------------- | ------------------------------ |
+| 端口     | `8048`                       | `7048`                         |
+| 协议     | `stratum+ssl://`（显式 TLS） | 明文 stratum（后自动切换 TLS） |
+| 矿工版本 | v2.9.1                       | v1.5.13                        |
+| 工作 GPU | GPU 1                        | GPU 0                          |
+
+→ **核心观察**：端口/协议不同。PeakMiner 一直用 TLS 8048，ForgeMiner 用明文 7048。
+
+第二步半：外部证据核实（矿池官网 + ForgeMiner 官方仓库）
+
+**矿池侧（Kryptex 官方文档，2026-08-14 抓取）**：
+
+
+| 来源                                            | 内容                                                                                                                         | 关键含义                                             |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| 官方教程（标注更新于**2026/8/12**，故障前一天） | 明文端口`stratum+tcp://prl.kryptex.network:7048`；SSL 方式**同一端口** `ssl://prl.kryptex.network:7048`                      | 7048 是官方默认端口，明文/TLS 共用，矿池正在推广 TLS |
+| 矿池主页                                        | 各区域 7048 端口上方标注**"TCP SSL"**                                                                                        | 7048 的官方定位已转向 SSL                            |
+| 矿池主页公告                                    | "All users must upgrade their miners. The Pearl team has**changed the algorithm** — old miners will submit invalid shares." | 矿池正在强制客户端升级（协议/算法变更期）            |
+| 配置示例                                        | `stratum+ssl://prl.kryptex.network:8048`（krig-miner 示例）                                                                  | 8048 是官方认可的 SSL 端口，与 PeakMiner 一致        |
+
+**ForgeMiner 侧（GitHub 0xHashRaptor/ForgeMiner Releases）**：
+
+
+| 版本    | 发布时间 (UTC) | 内容                                                                                                                                                              | 与本故障关系                 |
+| ------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| v1.5.11 | 08-11 21:15    | 修复**单向断连（silent share loss）**：池的 job 能到、提交无法送达时矿工无感知，最高丢 90% 份额；新增看门狗（25s 断开 / 45s 无响应重连）                          | 背景：连接可靠性是该版本重点 |
+| v1.5.12 | 08-12 15:33    | **TLS 全面可用**：修复 HiveOS 启动脚本剥离 `ssl://` 的问题（此前导致**明文连接 TLS 端口并无限重连**）；未指定协议时**自动检测 TLS**；断线原因区分化；网络容错增强 | ⚠️ 本故障直接相关的特性    |
+| v1.5.13 | 08-13 00:08    | 仅 Pearl 哈希率优化（CMP 50HX +33% 等）                                                                                                                           | 无连接修复（故障时运行版本） |
+| v1.5.14 | 08-13 08:50    | glibc 兼容 hotfix                                                                                                                                                 | 无关                         |
+| v1.5.15 | 08-14 00:17    | CMP 解锁 + plain 输出模式                                                                                                                                         | 无连接修复                   |
+
+> ⚠️ **决定性关联**：v1.5.12 的修复描述"此前导致**明文连接 TLS 端口并无限重连**"几乎就是本故障日志的翻版（`Connected to ...:7048` → `switching to TLS` → `TLS connect failed` 死循环）。说明 forge 在"明文连到要求 TLS 的端口"场景存在已知缺陷；v1.5.12 修了 HiveOS 剥离 `ssl://` 的触发路径，但我们容器里"未指定协议 + 矿池要求 TLS + TLS 端点不可用"的路径没有 fallback，仍会死循环。
+
+**端口实测（2026-08-14 故障后）**：
+
+
+| 端口          | 结果                                                            |
+| ------------- | --------------------------------------------------------------- |
+| 7048 TLS 握手 | ❌`unexpected eof while reading`（TLS 端点配置有缺陷/后端缺失） |
+| 7048 明文     | ✅ TCP 可连但无响应（明文服务已停，等待 TLS）                   |
+| 8048 TLS      | ✅ TLSv1.3 握手正常                                             |
+
+第三步：5 Whys 深挖触发点
+
+1. **为什么 forge 停止出块？**  → 因为无法向矿池提交 share。
+2. **为什么无法提交 share？**  → 因为连接矿池后 TLS 握手失败，无法进入正常 stratum 会话。
+3. **为什么 TLS 握手失败？**  → 因为 forge 被重定向到 TLS，但 `prl.kryptex.network:7048` 的 TLS 端点直接 EOF 关闭连接。
+4. **为什么 forge 会走 TLS？**  → 因为矿池在 forge 重连 7048 后返回了 `uses a secure connection — switching to TLS`，要求升级。
+5. **为什么 PeakMiner 没问题？**  → 因为它一开始就用 8048 TLSv1.3 端口，矿池该端口服务正常；而 7048 端口的服务已变质/下线，导致明文 + TLS 都不可用。
+
+→ **根因**：**矿池服务端对 7048 端口做了协议策略变更（明文 → 仅 TLS），但 7048 的 TLS 端点实现有缺陷（握手 EOF）**；ForgeMiner 客户端在切换 TLS 失败后无 fallback、无限重试，形成死循环。
+
+第四步：归因——矿池问题 vs 程序 BUG？
+
+**结论：矿池服务端变更为主因，ForgeMiner 容错缺陷为次因，运维配置为诱因。** 三方证据闭环：
+
+
+| 责任方                            | 具体表现                                                            | 证据                                                                     | 权重 |
+| --------------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------ | ---- |
+| **矿池服务端（主因）**            | 8/12 文档更新宣传 TLS、8/13 主动断开明文连接、7048 TLS 端点握手 EOF | 教程标注更新于 8/12、矿池主页 7048 标注 "TCP SSL"、openssl 实测 7048 EOF | 主因 |
+| **ForgeMiner 客户端（容错缺陷）** | TLS 切换失败后不 fallback、不告警、无限重试同一端点                 | v1.5.12 修复描述与故障现象高度吻合；1.5.13-1.5.15 均无相关修复           | 次因 |
+| **运维配置（诱因）**              | 选用明文 7048 且未配多池 failover，踩中矿池协议变更窗口             | docker-compose.yml                                                       | 诱因 |
+
+> 判定依据：矿池的"算法已变更、旧矿工提交无效份额"公告 + 文档 8/12 更新 + 7048 TLS 端点 EOF，三者共同证明是**矿池在故障窗口内主动调整了 7048 协议策略**，而非矿机本地或网络随机故障。ForgeMiner 的缺陷在于**没有对"服务端要求 TLS 但 TLS 不可用"这种中间态做容错**。
+
+时间线（UTC，矿池/文档/软件三方对照）
+
+
+| 时间           | 事件                                                                                                 | 归属     |
+| -------------- | ---------------------------------------------------------------------------------------------------- | -------- |
+| 08-11 21:15    | ForgeMiner v1.5.11 发布（修复 silent share loss）                                                    | 软件侧   |
+| 08-12 15:33    | ForgeMiner v1.5.12 发布（TLS 自动检测、修复"明文连 TLS 端口无限重连"）                               | 软件侧   |
+| 08-12 前后     | Kryptex 教程更新，7048 宣传为 SSL/TLS 端口                                                           | 矿池侧   |
+| 08-13 00:08    | ForgeMiner v1.5.13 发布（仅哈希率优化）                                                              | 软件侧   |
+| 08-13 21:29:48 | forge 最后一次`share accepted`                                                                       | 本地日志 |
+| 08-13 21:29:57 | `disconnected (pool closed the connection)`——矿池主动断开                                          | 矿池侧   |
+| 21:29:57 后    | `Connected to ...:7048` → `switching to TLS` → `TLS connect failed: unexpected end of file` × 907 | 双方共同 |
+| 08-14 00:17    | ForgeMiner v1.5.15 发布（CMP 解锁，无连接修复）                                                      | 软件侧   |
+| 08-14 修复后   | 改`ssl://prl.kryptex.network:8048` 恢复出块（282 TH/s）                                              | 本地操作 |
+
+修复方案对比与权衡
+
+
+| 方案                           | 改动                                                                         | 优点                                                                 | 缺点                                                            | 推荐度     |
+| ------------------------------ | ---------------------------------------------------------------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------- | ---------- |
+| **A. 改 ssl://8048（已采用）** | `docker-compose.yml` 中 forge `--pool` 改为 `ssl://prl.kryptex.network:8048` | 立即恢复；与 PeakMiner 同端口，实验变量更公平；利用矿池稳定 TLS 端点 | 两矿工用同一端口， loses "明文 vs SSL" 对比维度                 | ⭐⭐⭐⭐⭐ |
+| B. 尝试其他明文端口            | 找矿池是否提供替代明文端口                                                   | 保留协议对比实验设计                                                 | 矿池显然在推 TLS，新明文端口随时会失效                          | ⭐⭐       |
+| C. 升级 ForgeMiner 版本        | 升级后看是否支持新协议                                                       | 可能根本解决兼容性                                                   | 当时已是最新版 1.5.13；升级不保证 7048 恢复                     | ⭐⭐⭐     |
+| D. 多池 failover               | `--pool ssl://...:8048,ssl://备选:端口`                                      | 单端口故障可自愈                                                     | 需要矿池提供备选端点；PPS+ 收益可能来自不同矿池，实验数据不可比 | ⭐⭐⭐⭐   |
+
+**已执行**：方案 A，恢复后算力 282 TH/s，share accepted 正常。
+
+反思
+
+- **"之前正常"不等于"端口健康"**： forge 在 7048 上跑了一天多，直到服务端主动关闭并重协商协议才暴露问题。矿池文档 8/12 才更新宣传 TLS，故障窗口与矿池变更窗口高度重合——说明是**矿池主动变更**，不是矿机随机故障。
+- **"另一台正常"的误导性**： 两台矿机物理上共享网络和硬件，但协议路径不同（8048 TLS vs 7048 明文）。看到一台正常应立刻想到"协议/端口差异"，而不是"机器问题"。
+- **客户端容错短板是真实的**： ForgeMiner v1.5.12 官方修复文案"明文连接 TLS 端口并无限重连"证明这是已知缺陷类；但 v1.5.12-1.5.15 只修了 HiveOS 剥离 `ssl://` 的触发路径，**没有修"自动检测 TLS 失败后 fallback"的路径**。运维上需要靠 failover 或多池配置自保。
+- **验证矿池策略的唯一权威是矿池官方文档**： 矿池教程明确"地址和端口始终列在矿池页面，端口可能调整"。本次配置若在 8/12 文档更新时复核一遍端口策略，可提前规避。
+
+---
+
+## latest 镜像先 pull 再重建 260814
+
+> forge 软件需要更新，一般是什么步骤？镜像配的是 `latest`，删除本地已经下载的再重新启动是不是可以？
+
+`latest` tag 的镜像如何安全、正确地更新到新版？直接删本地镜像再启动是否可行？需要避免哪些坑？
+
+`latest` 不是固定版本，每次 pull 都会指向当前仓库最新 digest。正确流程是 **先 pull 再重建**，而非先删除。
+
+**为什么不能先删再重启？**
+
+- `docker rmi hashraptor/forge:latest` 会被拒绝，因为运行中的容器正引用该镜像。
+- 强删 `-f` 会破坏运行容器，导致 forge 矿机异常中断。
+
+**正确步骤（已执行）**：
 
 ```bash
 cd /root/deAI/pearl
-docker compose up -d                 # 启动/应用变更
-docker compose down                  # 停止全部
-docker compose logs -f forgeminer    # 看某个服务日志
-tail -f logs/miner.log               # PeakMiner 文件日志
-tail -f logs/forge.log               # ForgeMiner 文件日志
-docker restart kryptex-prl-forgeminer  # 单独重启某个矿工
+
+# 1. 拉取新 latest（远程 digest 与本地不同时会下载新版）
+docker compose pull forgeminer
+
+# 2. digest 变化时 compose 会自动 Recreate 容器
+docker compose up -d forgeminer
+
+# 3. 验证版本和算力
+docker exec kryptex-prl-forgeminer /opt/forge/forge --version
+
+# 4. 清理旧 dangling 镜像
+docker image prune -f
 ```
+
+**结果**：
+
+
+| 项目        | 变化                          |
+| ----------- | ----------------------------- |
+| 版本        | 1.5.13 →**1.5.15**           |
+| 镜像 digest | `382eb68e` → `a3912d8d`      |
+| 算力        | 274 TH/s，share accepted 正常 |
+| 空间回收    | 68MB                          |
 
 ---
 
-# 手动下载与测试（快速上手）
+## 镜像更新采用"自动发现 + 人工决定"：docker-updater > diun > WUD 260814
 
-以下步骤完全手动操作，不需要任何自动化脚本，适合初次验证。
+> 关键是如何发现新版本，从手动到自动。
 
-## 方式一：Docker（首选，最简部署）
+如何不靠人工登录 Docker Hub 就能及时知道 `hashraptor/forge:latest` 或 `peakminer/peakminer:latest` 有了新版本？有哪些自动化方案，各自的适用场景、风险和权衡是什么？
 
-一行命令启动，无需下载二进制、配置环境，自动重启。
+方案对比与权衡（2026 年现状）
 
-> **注意**：Docker 方式使用 PeakMiner（非 KRig）。PeakMiner 对 Pearl 算法优化更好（4090 算力 291.2 TH/s vs KRig 254 TH/s），但 devfee 为 2%（KRig 为 0%）。追求极致省心选 Docker，追求 0% devfee 选下面方式二的 KRig 二进制。
 
-### 前置依赖
+| 方案                            | 发现方式                                       | 更新方式                                                                        | 通知                            | 维护状态                             | 适用性                |
+| ------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------- | ------------------------------- | ------------------------------------ | --------------------- |
+| **docker-updater**              | 定时扫描 digest（不拉镜像）                    | **手动审批**：Web UI 一键更新，失败自动回滚，保留备份                           | ntfy / Apprise / GitHub webhook | ✅ 活跃                              | ⭐⭐⭐⭐⭐ 挖矿首选   |
+| **diun**                        | 定时扫描 digest                                | ❌ 只通知                                                                       | Telegram / Webhook / 邮件       | ✅ 活跃                              | ⭐⭐⭐⭐⭐ 纯通知首选 |
+| **WUD**（What's Up Docker）     | 定时扫描                                       | 标签控制：`wud.watch=true` 只监控 / 加 `wud.trigger.include=docker.auto` 才自动 | Webhook / Telegram              | ✅ 活跃，Watchtower 官方推荐的继任者 | ⭐⭐⭐⭐⭐            |
+| **脚本 + cron**（曾实现后取消） | `docker buildx imagetools inspect` 对比 digest | 可选`AUTO_UPDATE=1`                                                             | 自定义                          | 自维护                               | ⭐⭐⭐                |
+| **Watchtower**                  | 轮询镜像变化                                   | ✅ 全自动 pull + 重启                                                           | 无原生通知                      | ❌**2025-12-17 已归档停维护**        | ⭐ 不推荐             |
+| **手动订阅 RSS/邮件**           | 关注矿池/镜像 release                          | ❌                                                                              | 零技术成本                      | —                                   | 不推荐                |
 
-Docker 访问 GPU 需要宿主机安装 NVIDIA 驱动 + **NVIDIA Container Toolkit**。仅装 Docker 是不够的（`--gpus all` 依赖 nvidia-container-runtime）。
+> ⚠️ 重要更新：**Watchtower 已于 2025-12-17 官方停止维护并归档仓库**，不应再作为新方案。替代它的是 WUD（Watchtower 作者推荐）、docker-updater（手动审批制）等。
+
+核心判断：挖矿 ≠ 常规 Web 服务
+
+容器重启 = GPU 停摆 = 时薪损失 + 新版本带坑风险。因此正确策略是：
+
+> **自动"发现"，人工"决定"** —— 第一时间知道有新版，但何时更新、看 release notes 后再动手，由运维掌控。
+
+推荐落地：docker-updater（一个容器解决全部）
+
+```yaml
+services:
+  docker-updater:
+    image: ghcr.io/liquidguru/docker-updater:latest
+    container_name: docker-updater
+    restart: unless-stopped
+    ports: ["9292:9090"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+    environment:
+      CHECK_TIME: "03:00"        # 每天 3 点检查
+      TIMEZONE: Asia/Shanghai
+```
+
+核心能力：自动发现新版本并推送通知（ntfy 手机 App）→ Web UI 一键更新 → 更新失败自动回滚 → changelog 预览（判断是否值得更新）→ 成功后可保留旧版观察。
+
+管理平台（Rancher / 1Panel / Portainer）能否替代？
+
+**不能。** 用户追问后经分析：这些平台是"容器/服务器管理入口"，不是"镜像更新感知器"。
+
+
+|                       | Rancher          | 1Panel                            | Portainer       | docker-updater      |
+| --------------------- | ---------------- | --------------------------------- | --------------- | ------------------- |
+| 定位                  | K8s 平台         | 服务器面板                        | Docker 管理面板 | **镜像更新管理器**  |
+| 适配单机 Compose 矿机 | ❌               | ⚠️ 可以但不必要                 | ✅              | ✅                  |
+| 资源开销              | 高（K3s+多容器） | 中（整机级）                      | 低              | 极低（1 容器）      |
+| **发现新版本**        | ❌               | ❌                                | ❌              | ✅                  |
+| **推送通知**          | ❌               | ⚠️ 仅服务器告警，无镜像更新通知 | ❌              | ✅                  |
+| 自动更新/回滚         | ❌               | ❌                                | ❌              | ✅（手动审批+回滚） |
+
+- **Rancher**：为多节点 K8s 集群设计，单机 Compose 矿机完全不适用，改造即负优化
+- **1Panel**：面向网站/服务器运维，无镜像 digest 对比能力，装了仍需 diun 类工具补缺
+- **Portainer**：只有手动操作界面，不监控、不通知，解决不了原始诉求
+- 三者共同点：**没有"发现新版本 → 通知"的核心能力**，与 docker-updater/diun/WUD 是互补而非替代
+
+已实现的脚本（保留，但未启用 cron）
+
+`/root/deAI/pearl/bin/check-updates.sh`：
+
+- 对比本地与远程 digest
+- 重试 3 次 + Docker Hub API 兜底
+- 状态文件 `logs/.last-digests/` 防止重复告警
+- 可选通知：Telegram、自定义回调、日志
+- 调试开关：`SIMULATE_REMOTE_DIGEST=sha256:...`
+
+可手动运行：
 
 ```bash
-# 1. 确认 NVIDIA 驱动已安装
-nvidia-smi
-
-# 2. 安装 NVIDIA Container Toolkit（Ubuntu/Debian）
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-  | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-  | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-apt-get update && apt-get install -y nvidia-container-toolkit
-nvidia-ctk runtime configure --runtime=docker
-systemctl restart docker
-
-# 3. 验证 GPU 在容器内可见
-docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi
+/root/deAI/pearl/bin/check-updates.sh                 # 仅检查通知
+AUTO_UPDATE=1 /root/deAI/pearl/bin/check-updates.sh   # 检查并自动更新
 ```
 
-### 启动容器
+反思
 
-```bash
-# 拉取最新镜像
-docker pull peakminer/peakminer:latest
-
-# 创建日志目录
-mkdir -p /root/deAI/pearl/logs
-
-# SOLO 模式（费率 1%）—— 含日志持久化 + API + 外部 DNS
-# ⚠️ 使用 --network host，API 绑定在宿主机 127.0.0.1:4068
-docker run -d \
-  --gpus all \
-  --restart=unless-stopped \
-  --name kryptex-prl-peakminer \
-  --network host \
-  -v /root/deAI/pearl/logs:/var/log/peakminer \
-  --dns 8.8.8.8 \
-  --dns 1.1.1.1 \
-  peakminer/peakminer:latest \
-  --coin pearl \
-  -o stratum+ssl://prl.kryptex.network:8048 \
-  -u solo:prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl/agent \
-  -f /var/log/peakminer/miner.log \
-  --log-append \
-  --api-port 4068 \
-  --report-stats
-
-# PPS+ 模式（费率 2%，去掉 solo: 前缀）
-docker run -d \
-  --gpus all \
-  --restart=unless-stopped \
-  --name kryptex-prl-peakminer \
-  --network host \
-  -v /root/deAI/pearl/logs:/var/log/peakminer \
-  --dns 8.8.8.8 \
-  --dns 1.1.1.1 \
-  peakminer/peakminer:latest \
-  --coin pearl \
-  -o stratum+ssl://prl.kryptex.network:8048 \
-  -u prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl/agent \
-  -f /var/log/peakminer/miner.log \
-  --log-append \
-  --api-port 4068 \
-  --report-stats
-```
-
-| 参数 | 说明 |
-|------|------|
-| `-d` | 后台运行 |
-| `--gpus all` | 使用所有 GPU（指定单卡用 `--gpus '"device=0,1"'`） |
-| `--restart=unless-stopped` | 崩溃/重启后自动拉起 |
-| `--name kryptex-prl-peakminer` | 容器名，方便管理 |
-| `--network host` | 使用宿主机网络栈（替代 `-p` 端口映射）。PeakMiner API 硬编码绑定 `127.0.0.1`，bridge 模式下 `-p` 无法转发，必须用 host 模式才能从外部访问 API |
-| `-v /root/deAI/pearl/logs:/var/log/peakminer` | 日志持久化，容器删除后日志不丢失 |
-| `--dns 8.8.8.8 --dns 1.1.1.1` | **指定外部 DNS**，解决容器内部分矿池域名解析超时问题 |
-| `peakminer/peakminer:latest` | 使用最新镜像，确保算法兼容 |
-| `--coin pearl` | **必需参数**，指定币种为 Pearl |
-| `-o` | 矿池地址，推荐用全球节点 `prl.kryptex.network:8048`（SSL）；区域节点可能 DNS 不通 |
-| `-u` | 钱包/矿工名。PeakMiner **原样发送**，用 `/` 分隔钱包和矿工名；SOLO 模式加 `solo:` 前缀 |
-| `-f /var/log/peakminer/miner.log` | 日志写入文件（容器内路径，已通过 `-v` 映射到宿主机） |
-| `--log-append` | 追加模式写日志（重启不覆盖历史日志） |
-| `--api-port 4068` | 开启 HTTP 统计 API，默认绑定 `127.0.0.1` |
-| `--report-stats` | 向矿池上报挖矿统计信息 |
-
-> **关于矿池节点选择**：实测香港节点 `prl-hk` 在容器内 DNS 解析超时，全球节点 `prl.kryptex.network` 连接正常（ping ~170ms）。建议先用全球节点，或通过 `--dns` 指定外部 DNS 后再试区域节点。
->
-> **关于 `-u` 和 `--worker`**：PeakMiner 的 `-u` 参数是原样发送给矿池的，不会被拆分。如果 `-u` 中已包含 `/` 或 `.`，则 `--worker` 参数会被忽略。所以推荐直接用 `wallet/worker` 格式写在 `-u` 里，不用单独的 `--worker`。
-
-**常用管理命令**：
-
-```bash
-# 查看实时日志（容器 stdout/stderr）
-docker logs -f kryptex-prl-peakminer
-
-# 查看最近 50 行
-docker logs --tail 50 kryptex-prl-peakminer
-
-# 查看宿主机持久化日志文件
-tail -f /root/deAI/pearl/logs/miner.log
-
-# 查看 API 统计（容器启动后约 60s 才有数据）
-curl http://localhost:4068/
-
-# 停止挖矿
-docker stop kryptex-prl-peakminer
-
-# 重新启动
-docker start kryptex-prl-peakminer
-
-# 删除容器（先停止，日志因 -v 映射不会丢失）
-docker rm -f kryptex-prl-peakminer
-```
-
-> **为什么 Docker 用 PeakMiner 而不是 KRig？** Kryptex 矿池页面的 Docker 选项默认使用 PeakMiner，该镜像已在 Docker Hub 发布。KRig 目前没有官方 Docker 镜像。两者都是 Kryptex 矿池官方推荐的矿工，且 PeakMiner 在 Pearl 算法上算力更高（4090: 291.2 TH/s vs KRig 254 TH/s）。
+- 挖矿场景下，**"发现新版本"和"自动更新"是两回事**。自动更新可能引入不兼容配置或导致算力中断，因此通知 + 人工确认是更稳妥的默认策略。
+- 给矿机装 Rancher/1Panel 属于"为了看监控而买服务器"，不值得；docker-updater 自带的轻量 UI 已覆盖"能看到容器状态、有界面点一点"的体验。
+- 推荐优先级：**docker-updater > diun > WUD**，三者均可落地，视想要"纯通知"还是"审批式更新"而定。
 
 ---
 
-## 方式二：KRig 二进制（次选，0% devfee）
-
-直接运行二进制，无 Docker 开销，适合对容器不熟悉或追求极简的场景。
-
-### 1. 下载 KRig
-
-```bash
-mkdir -p /root/deAI/kryptex/bin && cd /root/deAI/kryptex/bin
-
-# 下载最新版 v1.2.0（2026-08-11）
-wget https://github.com/kryptex/krig-miner/releases/download/v1.2.0/krig-miner-1.2.0-linux-x64.tar.gz
-
-# 解压
-tar xzf krig-miner-1.2.0-linux-x64.tar.gz
-
-# 验证
-./krig-miner --version
-```
-
-### 2. 前台启动测试
-
-```bash
-cd /root/deAI/kryptex/bin
-
-# SOLO 模式（费率 1%）
-./krig-miner \
-  --url stratum+ssl://prl-hk.kryptex.network:8048 \
-  --user solo:prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl/agent
-
-# PPS+ 模式（费率 2%，去掉 solo:）
-./krig-miner \
-  --url stratum+ssl://prl-hk.kryptex.network:8048 \
-  --user prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl/agent
-```
-
-**预期输出**：启动后应看到 GPU 识别信息、矿池连接成功、开始接收任务、算力摘要行。按 `Ctrl+C` 退出。
-
-### 3. 后台运行（生产环境）
-
-```bash
-cd /root/deAI/kryptex/bin
-mkdir -p /root/deAI/pearl/logs
-
-# nohup 后台运行
-nohup ./krig-miner \
-  --url stratum+ssl://prl-hk.kryptex.network:8048 \
-  --user solo:prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl/agent \
-  > /root/deAI/pearl/logs/miner.log 2>&1 &
-
-# 记录 PID
-echo $! > /root/deAI/kryptex/run/miner.pid
-
-# 查看实时日志
-tail -f /root/deAI/pearl/logs/miner.log
-```
-
----
-
-## 方式三：PeakMiner 二进制（备选，Docker 的裸机替代）
-
-不想用 Docker 但想要 PeakMiner 的高算力，可以直接跑二进制。
-
-### 1. 下载
-
-```bash
-mkdir -p /root/deAI/kryptex/bin && cd /root/deAI/kryptex/bin
-
-wget https://github.com/peakminer/peakminer/releases/download/v2.9.0/peakminer-2.9.0-linux-x86_64 -O peakminer
-chmod +x peakminer
-./peakminer --version
-```
-
-### 2. 启动
-
-```bash
-# SOLO 模式（费率 1%）
-./peakminer \
-  --coin pearl \
-  -o stratum+ssl://prl-hk.kryptex.network:8048 \
-  -u solo:prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl/agent
-
-# PPS+ 模式（费率 2%）
-./peakminer \
-  --coin pearl \
-  -o stratum+ssl://prl-hk.kryptex.network:8048 \
-  -u prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl/agent
-
-# 后台运行
-nohup ./peakminer --coin pearl -o ... -u ... > /root/deAI/pearl/logs/miner.log 2>&1 &
-```
-
-> **`-u` 注意事项**：PeakMiner 将 `-u` 的值**原样发送**给矿池。如果 `-u` 中已含 `/` 或 `.`，则 `--worker` 参数会被忽略。建议直接用 `wallet/worker` 格式写在 `-u` 里。
-
----
-
-## 方式四：SRBMiner-MULTI 二进制（老卡备选）
-
-如果你的 GPU 不在 PeakMiner/KRig 支持范围（如 GTX 16xx），可用 SRBMiner。
-
-### 1. 下载
-
-```bash
-cd /root/deAI/kryptex/bin
-wget https://github.com/doktor83/SRBMiner-MULTI/releases/download/2.6.9/SRBMiner-Multi-2-6-9-Linux.tar.gz
-tar -xzf SRBMiner-Multi-2-6-9-Linux.tar.gz
-cd SRBMiner-Multi-2-6-9
-chmod +x SRBMiner-MULTI
-./SRBMiner-MULTI --version
-```
-
-### 2. 启动
-
-```bash
-# SOLO 模式（费率 1%）
-./SRBMiner-MULTI \
-  --algorithm pearlhash \
-  --pool prl-hk.kryptex.network:7048 \
-  --wallet solo:prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl \
-  --worker agent \
-  --password x
-
-# PPS+ 模式（费率 2%）
-./SRBMiner-MULTI \
-  --algorithm pearlhash \
-  --pool prl-hk.kryptex.network:7048 \
-  --wallet prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl \
-  --worker agent \
-  --password x
-```
-
-> **注意**：SRBMiner 使用 TCP 端口 7048，钱包和矿工名分开传参（`--wallet` + `--worker`），与 PeakMiner/KRig 的格式不同。
-
----
-
-## 日志解读
-
-以 PeakMiner v2.9.0 双卡 RTX 4090 PPS+ 模式为例：
-
-### 启动阶段
-
-```
-INFO peakminer/2.9.0 — coin=pearl wallet=prl1.../agent worker= devices=2 legacy_auth=false dev_fee=2.0%
-INFO API listening on http://127.0.0.1:4068/summary
-INFO connected prl.kryptex.network:8048  diff —  ping 419ms
-INFO new job a9aab31c_2097152
-INFO vardiff 9.01 PH
-```
-
-| 字段 | 含义 |
-|------|------|
-| `coin=pearl` | 当前币种 |
-| `dev_fee=2.0%` | PeakMiner 抽成，挖 1 小时约 1 分 12 秒给开发者 |
-| `devices=2` | 检测到 2 张 GPU |
-| `ping 419ms` | 到矿池延迟，< 200ms 理想，> 500ms 需换节点 |
-| `new job` | 矿池下发了新任务，正常 |
-| `vardiff 9.01 PH` | 矿池根据算力自动分配的难度（PH = PetaHash = 10^15 H） |
-
-### 每条 share 提交
-
-```
-accepted   GPU 0  lat 420ms  diff 9.01 PH  effort 46%
-```
-
-| 字段 | 含义 |
-|------|------|
-| `accepted` | ✅ 有效提交（`invalid` 或 `rejected` 则有问题） |
-| `GPU 0` | 哪张卡提交的 |
-| `lat 420ms` | 往返延迟（矿池发任务 → 算出结果 → 提交） |
-| `diff 9.01 PH` | 这个 share 的目标难度 |
-| `effort 46%` | 努力程度：实际耗时 ÷ 预期耗时。**< 100% = 运气好，> 100% = 运气差** |
-
-### 摘要面板（每 60s 打印）
-
-```
-pool prl.kryptex.network:8048    uptime 00:01:00    ping 369ms
-diff 9.01 PH    last share 8s ago    eta 16s    effort 47%    luck(1h/24h) 156%/156%
-
-GPU  Name        Hashrate  Shares ok/inv   Temp   Fan    Pwr        Perf      Mclk      Pclk
-───  ────────  ──────────  ─────────────  ─────  ────  ─────  ──────────  ────────  ────────
-  0  RTX 4090  289.7 TH/s       1 / 0      78°C   89%   449W  645.2 GH/W  10251MHz   2310MHz
-  1  RTX 4090  259.7 TH/s       1 / 0      87°C  100%   408W  636.6 GH/W  10251MHz   2070MHz
-───  ────────  ──────────  ─────────────  ─────  ────  ─────  ──────────  ────────  ────────
-Total          549.4 TH/s       2 / 0     eff 100.0%    857W  641.1 GH/W
-```
-
-#### 第一行（矿池/整体状态）
-
-| 字段 | 含义 |
-|------|------|
-| `uptime` | 已运行时长 |
-| `ping` | 当前矿池延迟 |
-| `diff` | 当前任务难度 |
-| `last share Xs ago` | 距离上次提交 share 的时间，持续 > 5min 需关注 |
-| `eta 16s` | 按当前算力预计多久找到一个 share |
-| `effort 47%` | 当前这个 share 的努力程度，< 100% = 运气好 |
-| `luck(1h/24h)` | **运气指数**：= 实际耗时 ÷ 理论耗时。**> 100% = 运气差**（花了更久），**< 100% = 运气好**。PPS+ 模式下运气不影响收益，但长期 > 200% 可能说明网络或算力不稳定 |
-
-#### GPU 表头含义
-
-| 列 | 含义 | 正常范围（4090） |
-|------|------|------|
-| `Hashrate` | 实时算力 | 280-292 TH/s |
-| `Shares ok/inv` | 累计有效/无效 share | inv 应为 0，偶发 1-2 个可接受 |
-| `Temp` | GPU 核心温度 | **< 80°C 理想**，80-85°C 可接受，> 85°C ⚠️ |
-| `Fan` | 风扇转速 % | 与温度正相关，100% 说明散热到极限 |
-| `Pwr` | 实时功耗（W） | 400-450W |
-| `Perf` | 能效（GH/W） | 630-650 GH/W |
-| `Mclk` | 显存频率（MHz） | ~10251 MHz |
-| `Pclk` | 核心频率（MHz） | ~2300 MHz（温度过高会自动降频） |
-| `eff 100.0%` | 总算力有效占比 | 100% 最佳，< 99% 需查原因 |
-
-#### ⚠️ 异常信号速查
-
-| 现象 | 可能原因 | 排查方向 |
-|------|---------|---------|
-| `invalid` 或 `rejected` 持续 > 1% | 版本过旧/超频不稳 | 升级矿工、降超频 |
-| `Temp > 85°C` 且 `Fan 100%` | 散热不足 | 清灰、改善风道、降功耗 |
-| `Pclk` 明显偏低（< 2000 MHz） | 温度过高触发降频 | 加 `--gpu-temp-stop` 限温 |
-| 两卡算力差距 > 10% | 散热不均或体质差异 | 检查 PCIe 插槽散热、调功耗 |
-| `luck` 长期 > 200% | 网络丢包或算力波动 | 换区域节点、检查 `ping` |
-| `timed out connecting` | DNS 或网络不通 | 加 `--dns`、换节点 |
-
----
-
-## PPS+ vs SOLO 模式对比
-
-| 模式 | 原理 | 费率 | 适合谁 |
-|------|------|------|--------|
-| **PPS+**（默认） | 按贡献算力稳定分账，收益可预期 | **2%** | 大多数矿工，追求稳定收益 |
-| **SOLO** | 独立爆块，爆一块独拿全部奖励，不爆则零收益 | **1%** | 算力极大或有「赌运气」心态 |
-
-简单说：PPS+ 是「细水长流，每天都有」，SOLO 是「要么不开张，开张吃很久」。以 Kryptex 当前 4.37 EH/s 的全网算力来看，单卡 4090（约 0.5 TH/s）SOLO 爆块的概率极低，**一般不建议小算力用户使用 SOLO 模式**。
-
-**切换方法**：无论 Docker、KRig 还是 SRBMiner，只需在钱包地址前加 `solo:` 前缀即可，其余参数不变。费率自动从 2% 降为 1%。
-
----
-
-## 常用管理命令速查
-
-### Docker 方式
-
-| 目的 | 命令 |
-|------|------|
-| 查看实时日志（stdout） | `docker logs -f kryptex-prl-peakminer` |
-| 查看持久化日志文件 | `tail -f /root/deAI/pearl/logs/miner.log` |
-| 查看最近 50 行 | `docker logs --tail 50 kryptex-prl-peakminer` |
-| 查看 API 统计 | `curl http://localhost:4068/` |
-| 停止挖矿 | `docker stop kryptex-prl-peakminer` |
-| 启动挖矿 | `docker start kryptex-prl-peakminer` |
-| 重启 | `docker restart kryptex-prl-peakminer` |
-| 删除容器 | `docker rm -f kryptex-prl-peakminer` |
-| 查看 GPU | `nvidia-smi` 或 `watch -n 1 nvidia-smi` |
-| 收益查询 | `https://pool.kryptex.com/zh-cn/prl` |
-
-### KRig 二进制方式
-
-| 目的 | 命令 |
-|------|------|
-| 验证二进制 | `./krig-miner --version` |
-| 查看帮助 | `./krig-miner --help` |
-| 前台运行 | 见上面"方式二" |
-| 后台运行 | `nohup ./krig-miner ... > logs/miner.log 2>&1 &` |
-| 查看日志 | `tail -f /root/deAI/pearl/logs/miner.log` |
-| 查进程 | `ps aux \| grep krig` |
-| 终止挖矿 | `pkill krig-miner` |
-| 查看 GPU | `nvidia-smi` 或 `watch -n 1 nvidia-smi` |
-
----
-
-## 区域选择建议
-
-| 位置 | 推荐节点 | 地址 |
-|------|---------|------|
-| 中国大陆 | 香港 | `prl-hk.kryptex.network:7048` |
-| 东南亚 | 新加坡 | `prl-sg.kryptex.network:7048` |
-| 欧洲 | 欧洲 | `prl-eu.kryptex.network:7048` |
-| 北美 | 北美 | `prl-us.kryptex.network:7048` |
-| 俄罗斯 | 俄罗斯 | `prl-ru.kryptex.network:7048` |
-| 不确定 | 全球 | `prl.kryptex.network:7048` |
-
----
-
-## ⚠️ 重要：算法升级提醒
-
-Pearl 团队已更改算法，**所有矿工必须使用最新版本**，旧版将提交 **100% 无效份额**：
-- KRig：使用最新版
-- SRBMiner-MULTI ≥ 3.5.3
-- PeakMiner ≥ 2.9.0
-- ARCMiner ≥ 0.3.1
-- Fl4shMiner ≥ 1.2.7
-
-**验证方法**：启动后观察 rejected 比例，正常应 < 1%。若 rejected 持续 > 10%，说明版本不对，需升级。
-
----
-
-## PeakMiner 关键命令选项速查
-
-> PeakMiner 是 Docker 方式的底层矿工，v2.9.0，devfee 2%。
-
-### 核心必填
-
-| 参数 | 环境变量 | 说明 | 示例 |
-|------|---------|------|------|
-| `-c, --coin` | `PEAK_COIN` | **必需**，币种名 | `--coin pearl` |
-| `-o, --url` | `PEAK_POOL` | 矿池地址，可重复多个做故障转移 | `-o stratum+ssl://prl-hk.kryptex.network:8048` |
-| `-u, --user` | `PEAK_WALLET` | 钱包地址，**原样发送**不拆分 | `-u solo:prl1xxx.../agent` |
-| `-p, --password` | `PEAK_PASSWORD` | 矿池密码（默认 `x`） | `-p x` |
-
-> **关于 `-u`**：PeakMiner 原样发送 `-u` 的值，矿工名用 `/` 分隔写在 `-u` 里即可（如 `wallet/worker`）。如果 `-u` 中已含 `/` 或 `.`，则 `--worker` 参数会被忽略。
-
-### 运维常用
-
-| 参数 | 说明 | 建议值 |
-|------|------|--------|
-| `-d, --devices` | 指定 GPU 编号 | `-d 0,1`（默认 `all`） |
-| `-i, --status-interval` | 状态打印间隔（秒） | `-i 30`（默认 60） |
-| `-j, --job-timeout` | 任务超时重连（秒） | 默认 180 |
-| `--keepalive` | 定期发送 mining.ping 保活 | 建议开启 |
-| `-a, --api-port` | HTTP API 端口（默认 4068） | `--api-port 4068`（0=禁用） |
-| `--report-stats` | 向矿池上报统计信息 | 建议开启 |
-
-### GPU 超频参数（每 GPU 设置）
-
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `--gpu-coreN <MHz>` | 核心频率偏移 | `--gpu-core0 150` |
-| `--gpu-lcoreN <MHz>` | 核心频率锁定 | `--gpu-lcore0 2500` |
-| `--gpu-memN <MHz>` | 显存频率偏移 | `--gpu-mem0 1000` |
-| `--gpu-lmemN <MHz>` | 显存频率锁定 | `--gpu-lmemN 10500` |
-| `--gpu-powerN <W\|%>` | 功耗限制 | `--gpu-power0 300` 或 `--gpu-power0 80%` |
-| `--gpu-fanN <%>` | 风扇转速（0-100%） | `--gpu-fan0 80` |
-| `--gpu-fan-targetN <°C>` | 闭环风扇目标温度 | `--gpu-fan-target0 70` |
-| `--gpu-temp-stopN <°C>` | 暂停 GPU 温度阈值 | `--gpu-temp-stop0 85` |
-| `--gpu-temp-startN <°C>` | 恢复 GPU 温度阈值 | `--gpu-temp-start0 70` |
-
-### 日志参数
-
-| 参数 | 说明 |
-|------|------|
-| `-l, --log-level` | 日志级别（默认 `info`） |
-| `-f, --log-file` | 日志文件路径 |
-| `--log-append` | 追加模式写日志 |
-
-### 算力参考（pearlhash，默认超频）
-
-| GPU | 算力 | 能效 |
-|------|------|------|
-| H200 | 643.0 TH/s | 924 GH/W |
-| RTX 5090 | 376.2 TH/s | 654 GH/W |
-| RTX 4090 | 291.2 TH/s | 649 GH/W |
-| RTX 5080 | 215.2 TH/s | 615 GH/W |
-| RTX 4080 SUPER | 203.0 TH/s | 636 GH/W |
-| RTX 3090 Ti | 150.6 TH/s | 336 GH/W |
-| RTX 3070 Ti | 98.4 TH/s | 318 GH/W |
-
----
-
-## KRig 关键特性
-
-| 特性 | 说明 |
-|------|------|
-| Devfee | **0%**（Kryptex 官方开发，无抽成） |
-| 支持 GPU | AMD RDNA 2/3/4、CDNA 4、集成 RDNA 3.5（需 `--amd-igpu`）；NVIDIA RTX 2000-5000 |
-| gzip 压缩 | 支持，可减少高达 80% 矿池流量 |
-| 连接方式 | 仅 SSL（端口 8048），无 TCP 回退 |
-| 后端自动检测 | 自动检测 CUDA / ROCm，一个二进制通吃 |
-| Stats API | 支持 `--api-port` 导出 Prometheus 指标 |
-| 算力参考 | 4090 ~254 TH/s，5090 ~335 TH/s，7900 XT ~41.4 TH/s（均低于 PeakMiner） |
-
-### KRig 命令行示例
-
-```bash
-# 基本命令（页面官方格式）
-./krig-miner --url stratum+ssl://prl.kryptex.network:8048 --user <wallet>
-
-# 指定区域 + SOLO
-./krig-miner \
-  --url stratum+ssl://prl-hk.kryptex.network:8048 \
-  --user solo:<wallet>/<worker>
-
-# 指定 GPU
-./krig-miner --url ... --user ... -d 0,1
-
-# 启用 API 监控
-./krig-miner --url ... --user ... --api-port 4058
-
-# 列出可用 GPU
-./krig-miner --list-devices
-```
-
-### KRig 主要参数速查
-
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `-o, --url` | 矿池地址（仅支持 `stratum+ssl://`） | `--url stratum+ssl://prl-hk.kryptex.network:8048` |
-| `-u, --user` | 钱包地址（SOLO 加 `solo:` 前缀） | `--user solo:prl1xxx.../worker` |
-| `-p, --password` | 矿池密码 | `-p x` |
-| `-d, --devices` | 指定 GPU 编号 | `-d 0,1` 或 `-d all` |
-| `--devices-pci` | 按 PCI 地址选 GPU | `--devices-pci 0000:01:00.0` |
-| `--no-cuda` / `--no-rocm` | 禁用 CUDA / ROCm 后端 | — |
-| `--amd-igpu` | 启用 AMD 集成显卡（RDNA 3.5） | — |
-| `--list-devices` | 列出检测到的所有 GPU | — |
-| `--api-port` | Prometheus 指标端口 | `--api-port 4058` |
-
----
-
-# 问题与解决
-
-实现过程中遇到的坑以及对应解法，按日期先后顺序记录：
-
-## 2026-08-11
-
-### Docker 容器内矿池 DNS 解析超时
-- **问题**：容器启动后日志持续报 `timed out connecting to prl-hk.kryptex.network:8048`，宿主机 TCP 测试该端口却可达
-- **根因**：容器使用默认 DNS（宿主机 `/etc/resolv.conf`），解析部分 Kryptex 区域节点域名超时。宿主机能通是因为系统 DNS 配置不同
-- **解决**：`docker run` 增加 `--dns 8.8.8.8 --dns 1.1.1.1` 指定外部 DNS；同时改用全球节点 `prl.kryptex.network` 替代区域节点 `prl-hk`
-- **教训**：容器 DNS 和宿主机 DNS 行为可能不一致，挖矿场景建议显式指定可靠的公共 DNS
-
-### PeakMiner `latest` 与固定版本实际相同
-- **问题**：文档原推荐锁定 `peakminer/peakminer:2.9.0`，后改为 `latest`
-- **验证**：实际运行时 `latest` 拉取到的也是 v2.9.0（build=20260811-d1c3a0），两者完全一致
-- **结论**：使用 `latest` 即可，PeakMiner 更新频率低且 `latest` 指向的就是最新稳定版
-
-### 4090 双卡算力验证
-- **实测数据**（`latest` / v2.9.0，全球节点，无超频）：
-  - GPU 0: 292.0 TH/s，76°C，448W，fan 82%，能效 651.9 GH/W
-  - GPU 1: 286.8 TH/s，85°C，449W，fan 98%，能效 638.8 GH/W
-  - 总算力: 578.9 TH/s，拒绝率 0%
-- **结论**：与 PeakMiner 官方标称 291.2 TH/s 基本一致，偏差 < 1%。GPU 1 温度偏高（85°C），建议考虑通过 `--gpu-fan-target1` 或 `--gpu-power1` 调优
-
-### PeakMiner API 绑定 127.0.0.1，bridge 模式 `-p` 端口映射无效
-- **问题**：Docker bridge 模式下 `-p 4068:4068` 端口映射正常，但宿主机和 VS Code 均无法访问 `http://localhost:4068/summary`
-- **根因**：PeakMiner 的 `--api-port` **硬编码绑定 `127.0.0.1`**（仅本地回环），不支持配置为 `0.0.0.0`。Docker bridge 模式虽然将宿主机流量转发到容器，但目标地址是容器内 `127.0.0.1`，外部连接无法命中 lo 接口
-- **解决**：改用 `--network host` 模式。host 模式下 API 直接监听宿主机 `127.0.0.1:4068`，宿主机 `curl localhost:4068/summary` 和 VS Code 端口转发均可正常访问
-- **教训**：挖矿软件 API 通常只考虑本机访问，不会监听 `0.0.0.0`。Docker 化部署时优先考虑 `--network host`
-
-### `-u` 参数中钱包地址被误替换
-- **问题**：文档中 SOLO 命令的 `-u` 值一度变成 `solo:https://github.com/peakminer/peakminer/agent`
-- **根因**：从网页复制时混入了页面上的占位文本
-- **解决**：修正为正确的 `solo:prl1pldsjzegmcujgsp5rlhslp4gyg6zvkcqq2czmpqrptezay0pcmd8sveydvl/agent`
-- **教训**：网页生成的命令中占位符需逐项核对，不能直接照搬
+遗留 / 后续可选
+
+- [ ]  **落地 docker-updater**（推荐）：一个容器解决"发现新版本 + 通知 + 一键更新 + 回滚"，手机装 ntfy 接收推送
+- [ ]  若只想要纯通知：落地 diun（Telegram/Webhook）
+- [ ]  为 ForgeMiner 配置多池 failover，解决 TLS EOF 死循环不自愈的问题
+- [ ]  第二轮实验跑满 24h 后取矿池均值，交叉验证软件效率差

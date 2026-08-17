@@ -1,5 +1,53 @@
 # vLLM 引擎
 
+## 🐛 download-model.sh：Content-Range 含 `\r` 导致大文件完整性校验失效 260817
+
+🤔 `download-model.sh qwen38` 二次执行时，`model.safetensors`（18G）和 `model-mtp.safetensors`（811M）明明已经完整下载，却始终打印"已存在 (大小 18G)，跳过 (远端大小无法获取)"，而不是预期的"已存在且完整，跳过"。但 `get_remote_size` 函数里已经用 `awk` 做了 `gsub(/\r/,"",v)` 去除回车——为什么还会失效？
+
+---
+
+✅ **结论**：问题不在 `get_remote_size` 内部，而在调用侧。
+
+`get_remote_size` 的 `awk` 只清理了 `Content-Range` 数值内的 `\r`，但 curl 的响应体本身是 HTTP/1.1 `\r\n` 格式——awk 处理后输出的字符串末尾仍可能带一个游离的 `\r`。传给 `remote_size` 变量后，`[ "${local_size}" -ge "${remote_size}" ]` 做整数比较时 bash 遇到 `849400424\r` 报错：
+
+```
+download-model.sh: line 158: [: 849400424\r: integer expression expected
+```
+
+bash 认为 `remote_size` 非整数，条件判断抛异常，进入 `[ -z "${remote_size}" ]` 分支，打印"远端大小无法获取"，实际上远端是能拿到的。
+
+✅ **修复**：在赋值后加一次 `tr -d '\r'`：
+
+```diff
+- remote_size=$(get_remote_size "${file}")
++ # 去除 \r，避免 HuggingFace Content-Range 头含回车导致整数比较失败
++ remote_size=$(get_remote_size "${file}" | tr -d '\r')
+```
+
+修复后再次执行 `bash download-model.sh qwen38`，两个大文件正确输出"已存在且完整，跳过"，不再误判。
+
+---
+
+## 📥 Qwen3.8-27B（18G）通过代理断点续传下载完成 260817
+
+HuggingFace `model.safetensors`（18.6 GB）下载过程中发生 **2 次连接中断**（`curl: (18) transfer closed with N bytes remaining`），curl `--retry 5` 自动断点续传重试，均恢复成功，最终完整下载。
+
+- **第1次中断**：剩余约 16.6 GB 时断开，curl 丢弃 49MB 已缓冲数据后续传
+- **第2次中断**：剩余约 14.5 GB 时断开，curl 丢弃 2.1GB 已缓冲数据后续传（速度提升到 500k-1MB/s 阶段，代理节点切换导致）
+- **总耗时约 7-8 小时**（速度波动大：初期 6-100 KB/s，重试后高峰 1MB/s+）
+- 脚本日志另有 `line 158: integer expression expected` 警告（即上条 `\r` bug）和 `line 188: tinue: command not found`（历史遗留，`continue` 在某次编辑中被行尾截断，已在当前版本自然修复）
+
+最终两个模型均完整：
+
+| 模型 | 大小 | 来源 | 状态 |
+|------|------|------|------|
+| Qwen3-Coder-30B-A3B-Instruct-AWQ | 16G | ModelScope | ✅ 完整 |
+| Qwen3.8-27B-W4A16-AWQ | 19G | HuggingFace | ✅ 完整 |
+
+---
+
+
+
 ## 📐 gpu-memory-utilization GPU 使用限制 260817
 
 🤔 vLLM（TP=2，双 4090）与  forge（绑定 GPU 0）同机运行，vLLM 按 0.90 预留显存后 GPU 0 只剩 0.9GB，forge 启动分配显存失败（`CUDA driver error 2`）崩溃重启循环。调低 utilization 到多少既能给矿工留出空间、又不牺牲 vLLM 的 KV cache？
