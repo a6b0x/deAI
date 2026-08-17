@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# retry-pull.sh — 自动重试拉取 vLLM 镜像
+# pull-engine.sh — 拉取 vLLM 推理引擎镜像（自动重试断点续传）
 # =============================================================================
+#
+# 拉取目标: vllm/vllm-openai:latest
+#   这是 vLLM 推理引擎的 Docker 镜像（含 CUDA/Python 环境），与模型权重无关。
+#   模型权重通过 download-model.sh 单独下载，挂载进容器使用。
 #
 # 背景: 免费 Docker 镜像加速源不稳定，大 layer(如 9dc141b872c1, 5.2GB)
 #       经常中途 EOF 中断。Docker 支持 layer 级断点续传——
@@ -10,9 +14,9 @@
 # 本脚本: 反复执行 docker pull 直到成功，配合 layer 续传，最终拉取完整镜像。
 #
 # 用法:
-#   cd /root/deAI/infra/vllm && bash retry-pull.sh
+#   cd /root/deAI/infra/vllm && bash pull-engine.sh
 #   # 可指定最大重试次数
-#   MAX_ATTEMPTS=20 bash retry-pull.sh
+#   MAX_ATTEMPTS=20 bash pull-engine.sh
 # =============================================================================
 
 set -uo pipefail

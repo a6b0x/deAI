@@ -1,6 +1,67 @@
-# vLLM 迁移笔记
+# vLLM 引擎
 
-> 📌 记录从 Ollama 迁移到 vLLM 的决策、踩坑与解决过程。部署配置见 [docker-compose.yml](../vllm/docker-compose.yml)，下载脚本见 [download-model.sh](../vllm/download-model.sh)。
+## 📐 gpu-memory-utilization GPU 使用限制 260817
+
+🤔 vLLM（TP=2，双 4090）与  forge（绑定 GPU 0）同机运行，vLLM 按 0.90 预留显存后 GPU 0 只剩 0.9GB，forge 启动分配显存失败（`CUDA driver error 2`）崩溃重启循环。调低 utilization 到多少既能给矿工留出空间、又不牺牲 vLLM 的 KV cache？
+
+---
+
+✅ **结论**：`0.90 → 0.80`，实测可用，KV cache 足够。
+
+- **每卡 0.80 × 24GB ≈ 19.3GiB 占用**（实测 19727MiB/卡），释放约 2.5GiB/卡
+- **硬占用构成**（不受 utilization 影响）：AWQ 权重 7.95 GiB + peak activation 0.37 + 非 torch 0.1 + CUDAGraph 0.11 ≈ 8.5 GiB/卡
+- **KV cache：10.22 GiB/卡，共 223,168 tokens**（max_model_len=65536 场景下充足）
+- 验证：`/v1/models` 返回 `qwen3-coder-30b`，`/health` 200，实测推理正常
+
+参数变更位置：`infra/vllm/docker-compose.yml` `vllm-coder.command`。
+
+⚠️ **两条关键经验**：
+
+1. utilization 按每卡均分控制（TP=2 无法单独限制某张卡），降低后两卡对称释放，不影响 TP 负载均衡
+2. 0.80 下 GPU 0 仍只剩 ~4.3GiB 空闲，**无法再容纳需 ~9.2GB 的 forge**——调参解决的是 vLLM 侧预留过大的问题，矿工与 vLLM 的容量冲突需另行分配 GPU（见后续条目）
+
+---
+
+## 🌐 Qwen3.8-27B AWQ 量化版国内无镜像，只能走代理 260816
+
+🤔 `download-model.sh qwen38` 当前走 Clash 代理从 HuggingFace 下载，能否改走 ModelScope 国内源或 hf-mirror 镜像，避免代理流量？
+
+---
+
+✅ **结论**：不能。经过多轮搜索验证，目前只能走代理。
+
+`philbert440/Qwen3.8-27B-W4A16-AWQ` 这个 AWQ 量化版**只存在于 HuggingFace**，ModelScope 上搜不到同款（官方 `Qwen/Qwen3.8-27B` 只有 BF16 原版，且 AWQ 量化版在 ModelScope 上不存在）。`hf-mirror.com` 对此模型直接 308 跳回 `huggingface.co`，等于没绕过。
+
+
+| 方案                      | 可行性 | 原因                                                                                             |
+| ------------------------- | ------ | ------------------------------------------------------------------------------------------------ |
+| 走 Clash 代理（当前方案） | ✅     | `download-model.sh` 的 `download_from_huggingface` 函数通过 `curl -x http://127.0.0.1:7890` 下载 |
+| ModelScope 国内源         | ❌     | 无此 AWQ 量化版                                                                                  |
+| hf-mirror.com             | ❌     | 308 跳回 huggingface.co                                                                          |
+
+**为什么必须用 AWQ 量化版？** 双 RTX 4090 总共 48GB 显存，BF16 原版 27B 模型权重 = 27B × 2 bytes = 54GB，已超过总显存，加上 KV Cache 等运行时开销完全无法运行。AWQ 量化压缩到 ~19.6GB，才能装下。
+
+---
+
+## 🔧 pull_policy: never 禁止 compose 自动拉取，统一由脚本管控 260816
+
+🤔 `retry-pull.sh` 命名只强调"重试"机制，看不出在干什么；且 `docker compose up` 时如果镜像不存在会触发自带 `docker pull`，与脚本逻辑重复。
+
+---
+
+✅ **结论**：重命名脚本 + compose 加 `pull_policy: never`，三步职责清晰不重叠。
+
+- `retry-pull.sh` → **`pull-engine.sh`**：明确这是拉取推理引擎镜像（与模型权重无关），与 `download-model.sh`（下载模型权重）命名对称
+- [docker-compose.yml](../vllm/docker-compose.yml) 公共锚点 `x-vllm-common` 加 `pull_policy: never`，禁止 compose 自动拉取镜像，统一由 `pull-engine.sh` 负责
+- 如果镜像不存在，`docker compose up` 会直接报错，提示用户先跑 `pull-engine.sh`，比之前静默触发一次大概率失败的内置 pull 更清晰
+
+最终流程：
+
+```
+pull-engine.sh       ← 拉取推理引擎（vllm/vllm-openai:latest，~28GB，自动重试）
+download-model.sh    ← 下载模型权重（safetensors，~17-20GB，断点续传）
+docker compose up    ← pull_policy: never，只用本地已有镜像
+```
 
 ---
 
@@ -56,13 +117,14 @@ docker compose --profile coder  up -d    # 切换回 Coder
 
 ✅ **结论**：需要重新下载。Ollama 的 GGUF 权重与 vLLM 的 AWQ safetensors 是两套完全不同的量化方案，不存在复用路径。
 
-| 对比项 | Ollama 现状 | vLLM 需要 |
-|--------|-------------|-----------|
-| 存储位置 | `/root/deAI/infra/ollama/data/` | `/root/deAI/infra/vllm/data/` |
-| 权重格式 | **GGUF**（`blobs/`+`manifests/`，Q4_K_M） | **safetensors**（AWQ 4-bit） |
-| 模型标识 | `qwen3-coder-opt:30b` | `tclf90/Qwen3-Coder-30B-A3B-Instruct-AWQ` |
-| 下载来源 | Ollama 仓库 | **ModelScope（魔搭）** |
-| 磁盘占用 | 约 18GB | 约 16.8GB |
+
+| 对比项   | Ollama 现状                               | vLLM 需要                                 |
+| -------- | ----------------------------------------- | ----------------------------------------- |
+| 存储位置 | `/root/deAI/infra/ollama/data/`           | `/root/deAI/infra/vllm/data/`             |
+| 权重格式 | **GGUF**（`blobs/`+`manifests/`，Q4_K_M） | **safetensors**（AWQ 4-bit）              |
+| 模型标识 | `qwen3-coder-opt:30b`                     | `tclf90/Qwen3-Coder-30B-A3B-Instruct-AWQ` |
+| 下载来源 | Ollama 仓库                               | **ModelScope（魔搭）**                    |
+| 磁盘占用 | 约 18GB                                   | 约 16.8GB                                 |
 
 挂载目录相互隔离，两套引擎可以同时存在互不影响。
 
@@ -93,6 +155,7 @@ docker compose --profile coder  up -d    # 切换回 Coder
 Docker **支持 layer 级断点续传**，已完成的 layer 会保留（日志里大量 `Already exists`），只有校验失败的 `9dc141b872c1` 需要重下，并非真正从头开始，属正常行为。
 
 根本原因是网络问题：
+
 1. Docker daemon 配置了 7890 代理（`/etc/systemd/system/docker.service.d/http-proxy.conf`），所有 `docker pull` 走代理访问 Docker Hub，代理节点不稳定导致大文件中途 EOF
 2. 免费镜像加速源（`docker.1ms.run` 等）实测带宽极低（<1KB/s）或直接 429 限流
 
@@ -107,6 +170,7 @@ Docker **支持 layer 级断点续传**，已完成的 layer 会保留（日志�
 ---
 
 原因有两个：
+
 1. **镜像入口点变了**：新版 `vllm/vllm-openai:latest` 的 `ENTRYPOINT=[vllm serve]`，容器命令会被当作 `vllm serve` 的参数解析，而不是独立执行的 shell 命令
 2. **CLI 命令已弃用**：`huggingface-cli` 已被新版废弃，需改用 `hf` 命令
 
@@ -121,6 +185,7 @@ Docker **支持 layer 级断点续传**，已完成的 layer 会保留（日志�
 ---
 
 三个层叠的原因：
+
 1. 容器默认 **bridge 网络**无法直连 hf-mirror（超时）
 2. 7890 代理只监听 `127.0.0.1`，容器通过网关 IP 访问宿主机代理不通
 3. **最根本**：`Qwen/Qwen3-Coder-30B-A3B-Instruct-AWQ` 这个模型 ID 在 HuggingFace 上根本不存在
@@ -140,6 +205,7 @@ Docker **支持 layer 级断点续传**，已完成的 layer 会保留（日志�
 vLLM 提供 OpenAI 兼容接口，Open WebUI 原生支持，前端页面不用动。但连接 vLLM **必须走 OpenAI 协议**（`/v1/models`），不能走 Ollama 协议（`/api/tags`）。
 
 变化点：
+
 - 模型名变化：前端选 `qwen3-coder-opt:30b` → 改选 `qwen3-coder-30b`
 - RAG 嵌入：当前 Open WebUI 用 Ollama 的 `nomic-embed-text`，vLLM 只做推理，嵌入模型需单独处理
 
@@ -152,16 +218,19 @@ vLLM 提供 OpenAI 兼容接口，Open WebUI 原生支持，前端页面不用�
 ---
 
 三个层叠原因：
+
 1. 最初用 `OLLAMA_BASE_URL=http://127.0.0.1:18000/v1` 连接 vLLM，Open WebUI 走 **Ollama 协议**（`/api/tags`、`/api/version`）查模型，vLLM 返回 404
 2. 改为 `OPENAI_API_BASE_URL`（单数）后仍不行，因为数据库已有记录，环境变量不覆盖已存在的配置
 3. **关键**：Open WebUI 配置数据库（`webui.db`）里 `openai.api_base_urls` 仍是默认的 `https://api.openai.com/v1`，需直接修改数据库
 
 ✅ **解决**：用 `OPENAI_API_BASE_URLS`（复数）环境变量，并**直接修改数据库**：
+
 ```
 openai.api_base_urls = ["http://127.0.0.1:18000/v1"]  → 指向本机 vLLM
 openai.api_keys      = ["dummy"]
 ollama.enable        = false                           → 禁用 Ollama 路由
 ```
+
 改完重启 Open WebUI，模型列表正常显示 `qwen3-coder-30b`，对话成功。
 
 ---
@@ -175,6 +244,7 @@ ollama.enable        = false                           → 禁用 Ollama 路由
 关闭认证（`WEBUI_AUTH=False`）只跳过登录流程，但 Open WebUI 仍然检查用户角色。数据库 `webui.db` 用户表中 `role` 字段为 `pending`（待审批），触发激活页面与认证开关无关。
 
 ✅ **解决**：执行 SQL 将所有 pending 用户提升为 admin，刷新页面即可访问，无需重启：
+
 ```sql
 UPDATE user SET role='admin' WHERE role='pending'   -- 6 个用户全部改为 admin
 ```
@@ -194,6 +264,7 @@ Open WebUI 在对话时默认向 vLLM 发送 `tools`（工具调用）参数，�
 ```
 
 ✅ **解决**：在 `docker-compose.yml` 的 vLLM command 里加两个参数，重建容器：
+
 ```
 --enable-auto-tool-choice           # 启用自动工具选择
 --tool-call-parser=qwen3_coder      # Qwen3-Coder 专用工具解析器
