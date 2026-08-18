@@ -20,7 +20,7 @@ x-logging: &default-logging
 # host 网络：挖矿长连接免 NAT 开销，API 直连宿主机端口；
 # 显式 DNS：防宿主机 DNS 解析矿池域名失败；restart: 崩溃/重启后自动拉起
 x-peak-common: &peak-common
-  image: peakminer/peakminer:latest
+  image: peakminer/peakminer:2.11.0
   restart: unless-stopped
   network_mode: host
   dns: [8.8.8.8, 1.1.1.1]
