@@ -1,5 +1,133 @@
 # vLLM 引擎
 
+## 🖥️ VS Code 右侧栏 Chat 接入本地 vLLM：配置与"首字慢"排查 260818
+
+🤔 在 VS Code 右侧栏 Chat 面板接入本地 vLLM（`qwen3-coder-30b`，10.8.0.8:18000），配置后模型一直"正在思考"、首字响应很慢，到底该怎么配置、慢在哪？
+
+---
+
+✅ **结论**：VS Code 1.122+ **原生支持**自定义 OpenAI 兼容端点，无需任何插件。服务端实测极快（stream TTFB 0.005s、总耗时 0.24s、长 prompt 600KB 仅 9.5s、无 thinking），"还在思考"是 **VS Code 侧配置问题**。
+
+**1. 图形化入口**：右侧栏 Chat 面板 → 聊天框上方模型选择器 → 齿轮图标 → 添加模型 → **自定义端点（Custom Endpoint）**，自动打开 `chatLanguageModels.json`。也可 `Ctrl+Shift+P` 搜 `Chat: Language Models`。
+
+**2. 标准配置**（直接可用）：
+
+```json
+[
+  {
+    "name": "vLLM Local",
+    "vendor": "customendpoint",
+    "apiKey": "dummy",
+    "apiType": "chat-completions",
+    "models": [
+      {
+        "id": "qwen3-coder-30b",
+        "name": "Qwen3-Coder-30B (Local)",
+        "url": "http://10.8.0.8:18000/v1",
+        "toolCalling": true,
+        "vision": false,
+        "maxInputTokens": 32768,
+        "maxOutputTokens": 8192
+      }
+    ]
+  }
+]
+```
+
+`url` 只到 `/v1`（VS Code 自动拼 `/chat/completions`）；`apiKey` 任意占位（vLLM 不校验）。
+
+**3. 三个必改的坑**：
+
+
+| 坑               | 错误写法                           | 后果                                                                                                                         |
+| ---------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `vision`         | `true`                             | 模型是纯文本，VS Code 以为能看图会附加图像内容，交互异常卡住 → 必须`false`                                                  |
+| `maxInputTokens` | `128000`                           | 超过 vLLM 的`--max-model-len=65536`，请求被拒/截断，表现为长时间无响应 → 设 ≤65536                                         |
+| 冗余 provider    | 多留一个无`models` 数组的 provider | VS Code 自动探测出的模型 id 是 HF 原始名（`tclf90/...`），与 `served-model-name` 不一致，选错就空转 → 只留一个完整 provider |
+
+**4. 服务端无"思考"验证法**：响应中无 `reasoning_content` 字段、无 `<think>` 标签 = vLLM 未启用 reasoning，模型不会自己"思考"。
+
+**5. 长上下文首字慢是物理规律**：Agent 模式下 VS Code 每次请求把全部历史 + 工具结果 + 代码重发做 prefill。Qwen3-Coder-30B 实际激活 3B，prefill 约 3-6K token/s：上下文 2K → 首字 <1s；20K → 3-6s；50K+ → 10-15s+。缓解：新任务开新会话、按需引用文件、控制对话长度。
+
+---
+
+## ⚠️ forge占用 → vLLM 反复重启、WebUI 看不到模型 260818
+
+🤔 网页端（Open WebUI）看不到模型，`docker ps` 显示 vllm 容器一直在重启，API 端口也连不上，是什么原因？
+
+---
+
+✅ **结论**：kryptex forge 容器占用 GPU 0（约 9GB 显存 + 利用率 100%），vLLM `--gpu-memory-utilization=0.90` 需要每卡 21.17 GiB，启动报错后由 `restart: unless-stopped` 无限重启循环 → `18000` 端口始终无服务 → WebUI 模型列表为空。
+
+**启动失败关键报错**：
+
+```
+ValueError: Free memory on device cuda:0 (13.89/23.52 GiB) on startup is less than
+desired GPU memory utilization (0.9, 21.17 GiB). Decrease GPU memory utilization...
+```
+
+**排查方法**：
+
+```bash
+nvidia-smi                          # 看谁占显存（forgeminer 进程 /opt/forge/forge）
+docker inspect <容器> --format '{{.State.Restarting}} {{.RestartCount}}'   # 确认重启循环
+docker logs vllm-coder 2>&1 | grep -iE "less than|free memory"            # 找根因报错
+```
+
+**解决**：停挖矿 → 显存释放 → 重启 vLLM 即可（`cd /root/deAI/infra/pearl && docker compose down`）。
+⚠️ 关联上文 `gpu-memory-utilization 0.90→0.80` 条目：即使降到 0.80 也只给 forge 留 ~4.3GiB（forge 需 ~9.2GB），**挖矿与 vLLM 无法同卡共存，只能错开跑**。
+
+---
+
+## 📊 服务能力评估：并发上限与输出速率 260817
+
+🤔 双 4090 + Qwen3-Coder-30B-A3B（AWQ, TP=2）当前服务到底能跑多少并发、输出速率多少？怎么判断是否够用、什么时候该调参？
+
+---
+
+✅ **结论**（归档时点实测，vLLM v0.26.0，模型 `qwen3-coder-30b`）：
+
+**1. 最大并发 = 4**
+
+- 硬性上限来自 `--max-num-seqs=4`（`infra/vllm/docker-compose.yml` `vllm-coder.command`），第 5 个请求进入等待队列。
+- 理论值：启动日志里 vLLM 自报 `GPU KV cache size: 223,168 tokens`、`Maximum concurrency for 65,536 tokens per request: 3.41x`。
+  - 算法：**KV cache 总容量 ÷ max-model-len** = 223,168 ÷ 65,536 ≈ 3.41
+  - 即每个请求都用满 64K 上下文时，3 个并发已是极限；配置取 4 是因为实际请求上下文远小于 64K（日常聊天几十~几千 token）。
+- KV cache 来源：每卡 24,564 MiB，`gpu-memory-utilization=0.80`，扣权重（AWQ 7.95 GiB/卡）+ CUDA graph 等后得 10.22 GiB/卡，双卡合计 223,168 tokens。
+
+**2. 实测输出速率**（`/metrics` 直方图累计值推算，31 请求 / 2405 token）：
+
+- 平均生成速度 ≈ **67 tokens/s**（单序列）：`inter_token_latency_seconds_sum 35.82 / count 2405`
+- TTFT（首 token 延迟）≈ **113 ms**：`time_to_first_token_seconds_sum 3.49 / count 31`
+- 注意：`docker logs` 里的 `Avg generation throughput`（每 10s 打印）是瞬时窗口值，随负载剧烈波动（0~15 tok/s），不代表硬件能力，评估能力看 `/metrics` 直方图。
+
+**3. 实时监控命令**：
+
+```bash
+# 当前并发/排队/抢占/KV cache 用量
+curl -s localhost:18000/metrics | grep -E "vllm:(num_requests_running|num_requests_waiting|num_preemptions_total|gpu_cache_usage_perc)"
+# 一行算出平均生成速率
+curl -s localhost:18000/metrics | \
+  awk '/^vllm:inter_token_latency_seconds_(sum|count)/ {gsub(/\{.*/,""); if($0 ~ /_sum/) s=$2; else c=$2} END {printf "平均生成速度: %.1f tokens/s (共 %d 个 token)\n", c/s, c}'
+```
+
+**4. 判断并发是否够用的三指标**（归档时点全部健康：preemptions=0、waiting=0、KV cache 用量 0% → 4 并发远未吃满）：
+
+
+| 指标                                      | 危险信号                                                       |
+| ----------------------------------------- | -------------------------------------------------------------- |
+| `num_preemptions_total`                   | >0 = 序列被挤出（并发/上下文过长），需降并发或降 max-model-len |
+| `num_requests_waiting{reason="capacity"}` | 长期 >0 = 忙不过来，可加并发                                   |
+| `gpu_cache_usage_perc`                    | 接近 1.0 再加大并发会触发抢占                                  |
+
+**5. 扩容路径**（如需更大并发）：
+
+- 短上下文场景（8~16K）直接把 `--max-num-seqs` 提到 6~8，观察 preemptions 不涨即可。
+- 降 `--max-model-len` 到 32K：满并发理论值翻倍至 ~6.8。
+- 提 KV cache：日志建议 `--kv-cache-memory=15249657856`（14.2 GiB/卡）可充分利用显存（当前 10.22 GiB/卡，+40% 容量）；前提是矿机容器（forge 绑 GPU0）已停，否则留不出空间。
+
+---
+
 ## 🐛 download-model.sh：Content-Range 含 `\r` 导致大文件完整性校验失效 260817
 
 🤔 `download-model.sh qwen38` 二次执行时，`model.safetensors`（18G）和 `model-mtp.safetensors`（811M）明明已经完整下载，却始终打印"已存在 (大小 18G)，跳过 (远端大小无法获取)"，而不是预期的"已存在且完整，跳过"。但 `get_remote_size` 函数里已经用 `awk` 做了 `gsub(/\r/,"",v)` 去除回车——为什么还会失效？
@@ -39,14 +167,13 @@ HuggingFace `model.safetensors`（18.6 GB）下载过程中发生 **2 次连接�
 
 最终两个模型均完整：
 
-| 模型 | 大小 | 来源 | 状态 |
-|------|------|------|------|
-| Qwen3-Coder-30B-A3B-Instruct-AWQ | 16G | ModelScope | ✅ 完整 |
-| Qwen3.8-27B-W4A16-AWQ | 19G | HuggingFace | ✅ 完整 |
+
+| 模型                             | 大小 | 来源        | 状态    |
+| -------------------------------- | ---- | ----------- | ------- |
+| Qwen3-Coder-30B-A3B-Instruct-AWQ | 16G  | ModelScope  | ✅ 完整 |
+| Qwen3.8-27B-W4A16-AWQ            | 19G  | HuggingFace | ✅ 完整 |
 
 ---
-
-
 
 ## 📐 gpu-memory-utilization GPU 使用限制 260817
 
@@ -321,3 +448,5 @@ Open WebUI 在对话时默认向 vLLM 发送 `tools`（工具调用）参数，�
 验证：模型能识别"查节气"需求并返回 `tool_calls`（调用 get_date），常规对话也正常。
 
 ⚠️ **补充**：工具调用返回 `tool_calls` 只是模型表达了"我需要调用工具"，Open WebUI 还需要在工作区创建对应工具（如"获取日期"）并绑定到模型，才能真正执行并返回结果。
+
+---
