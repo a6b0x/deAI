@@ -1,0 +1,13 @@
+# 为 Rancher 内嵌 k3s 的 containerd 配置镜像加速
+# 背景：Rancher 容器内嵌 k3s 不读宿主 docker daemon.json，需单独配置
+# 原因：直连 registry-1.docker.io 走代理 fake-ip 超时，导致系统镜像拉取失败
+#       （coredns/pause/helm-operation 等全部卡住，界面报 API Aggregation not ready）
+# 2026-08 实测：USTC/网易镜像源已关停（no such host），quay.io/ghcr.io 直连可用
+
+mirrors:
+  docker.io:
+    endpoint:
+      - "https://dockerproxy.net"
+      - "https://docker.1ms.run"
+      - "https://docker.m.daocloud.io"
+  # quay.io / ghcr.io 直连可达，无需 mirror

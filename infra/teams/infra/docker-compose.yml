@@ -1,0 +1,57 @@
+# =============================================================================
+# team-infra：基础设施 / DevOps 团队 compose 模板（配额写死）
+# =============================================================================
+# 硬件背景：宿主 EPYC 7302(16C/32T) + 128G + 双 RTX 4090(24G) + 2TB NVMe
+# 配额总账见 ../README.md；本模板内 deploy.resources 为硬编码，禁止用 ${VAR} 覆盖。
+#
+# 使用：
+#   cd /root/deAI/infra/teams/infra
+#   cp .env.example .env
+#   docker compose up -d                # 启动（占位 nginx，替换为团队真实服务）
+#   docker compose config --quiet && echo OK   # 语法校验
+#   docker compose down
+#
+# 配额（写死，勿改）：
+#   CPU : 1.0 (limits) / 0.5 (reservations)
+#   内存 : 8G (limits) / 2G (reservations)
+#   GPU : 无
+#   PID : 512 (limits)
+# =============================================================================
+
+name: team-infra
+
+services:
+  # ---- 示例服务：替换 image/command/volumes 为团队真实业务服务 ----
+  app:
+    image: nginx:alpine
+    container_name: team-infra-app
+    restart: unless-stopped
+    ports:
+      - "${INFRA_HTTP_PORT:-18400}:80" # 端口可改，配额不可改
+    environment:
+      - TZ=Asia/Shanghai
+    # 显式真实 DNS：mihomo fake-ip 仅接管宿主流量，桥接容器必须走真实 DNS 才能联网
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"                # 多团队共享 2TB NVMe，限制日志防吃满磁盘
+        max-file: "3"
+    networks:
+      - team-infra-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"                  # CPU 配额写死
+          memory: 8G                   # 内存配额写死
+          pids: 512                    # 进程数限制
+        reservations:
+          cpus: "0.5"
+          memory: 2G
+
+networks:
+  team-infra-net:
+    name: team-infra-net
+    driver: bridge

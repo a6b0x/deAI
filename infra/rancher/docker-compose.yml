@@ -1,0 +1,43 @@
+# Rancher Manager v2.14 单机 Docker 部署
+# 参考：https://documentation.suse.com/cloudnative/rancher-manager/v2.14/
+# 说明：
+#   - 官方 v2.14 已推荐 Helm 方式部署，本 compose 仅用于单机评估/沙盒环境（非生产）
+#   - 桥接网络（默认）：独立网络命名空间，避免与宿主机已运行的 k3s(6443/2379/2380) 端口冲突
+#   - 真实 DNS：本机 mihomo 透明代理(fake-ip 模式)会劫持 DNS 返回 198.18.x.x，
+#     而代理只接管宿主机流量、绕过 docker 桥接网络，导致容器内全部外网超时。
+#     故必须给容器指定真实 DNS(223.5.5.5)，走默认网关的真实出口联网
+#   - 镜像加速：内嵌 k3s 的 containerd 不读宿主 docker daemon.json，需挂载 registries.yaml
+
+name: rancher
+
+services:
+  rancher:
+    image: rancher/rancher:v2.14.0
+    container_name: rancher
+    restart: unless-stopped
+    # 硬性要求：entrypoint.sh 检查 /dev/kmsg，非 privileged 容器无该设备会报错退出
+    privileged: true
+    ports:
+      - "8008:80"   # HTTP
+      - "8443:443"  # HTTPS
+    dns:
+      - 223.5.5.5        # 阿里 DNS（真实解析，绕过 fake-ip）
+      - 119.29.29.29     # 腾讯 DNS（备用）
+    volumes:
+      - rancher-data:/var/lib/rancher
+      # 内嵌 k3s 的 containerd 镜像加速（不读宿主 daemon.json，必须挂载）
+      - ./registries.yaml:/etc/rancher/k3s/registries.yaml:ro
+    environment:
+      # 使用宿主机的系统时间，避免容器内时间漂移
+      - TZ=Asia/Shanghai
+    # Rancher 官方 Docker 安装要求 privileged，且建议限制内存
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+        reservations:
+          memory: 2g
+
+# 持久化数据卷
+volumes:
+  rancher-data:       # Rancher 核心配置与集群数据
